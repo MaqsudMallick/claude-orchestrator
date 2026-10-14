@@ -697,3 +697,311 @@ def test_pert_needs_no_terminal(monkeypatch: pytest.MonkeyPatch) -> None:
     snaps = _two_waves()
     first = live._pert_lines(snaps, "tests", 60, True)
     assert first == live._pert_lines(snaps, "tests", 60, True)
+
+
+# -- the status vocabulary ---------------------------------------------------
+#
+# Glyphs are what a glance at the header's chart actually reads, and it lays
+# out columns by `len`, so a glyph that is not exactly one narrow character
+# shifts everything after it. Tables are read through `live._UNICODE_GLYPHS` and
+# `live._ASCII_GLYPHS`; everything about how they *render* is checked through
+# `_pert_lines` and the header functions, not by peeking at how the module
+# stores them.
+
+STATUSES = ("pending", "running", "ok", "failed", "skipped")
+
+
+def _table(unicode: bool) -> dict[str, str]:
+    return live._UNICODE_GLYPHS if unicode else live._ASCII_GLYPHS
+
+
+@pytest.mark.parametrize("unicode", BOTH)
+def test_glyph_tables_cover_every_status_a_task_can_have(unicode: bool) -> None:
+    # The statuses `TaskStream.status` documents. A missing one renders as "?".
+    assert set(_table(unicode)) >= set(STATUSES)
+
+
+def test_glyph_tables_cover_the_same_statuses() -> None:
+    # Neither table may gain a status the other lacks: a status that only one
+    # mode knows would draw as "?" on the other kind of terminal.
+    assert set(live._UNICODE_GLYPHS) == set(live._ASCII_GLYPHS)
+
+
+@pytest.mark.parametrize("unicode", BOTH)
+def test_every_glyph_is_exactly_one_narrow_character(unicode: bool) -> None:
+    import unicodedata
+
+    for status, glyph in _table(unicode).items():
+        assert isinstance(glyph, str)
+        # `||` for pause would be the obvious mistake; it is two columns.
+        assert len(glyph) == 1, (status, glyph)
+        # One code point is not enough: a wide or fullwidth character (such as
+        # some emoji-style pause marks) takes two cells, a combining mark or
+        # format character takes none. Either breaks the column arithmetic.
+        assert unicodedata.east_asian_width(glyph) not in ("W", "F"), (status, glyph)
+        assert unicodedata.combining(glyph) == 0, (status, glyph)
+        assert unicodedata.category(glyph) not in ("Mn", "Me", "Cf", "Cc", "Zs"), (status, glyph)
+        assert glyph.isprintable(), (status, glyph)
+
+
+def test_ascii_glyph_table_is_pure_ascii() -> None:
+    text = "".join(live._ASCII_GLYPHS.values())
+    assert text.isascii(), [c for c in text if not c.isascii()]
+
+
+@pytest.mark.parametrize("unicode", BOTH)
+def test_every_status_has_its_own_glyph(unicode: bool) -> None:
+    # Two statuses sharing a glyph cannot be told apart on screen at all.
+    table = _table(unicode)
+    assert len(set(table.values())) == len(table), table
+
+
+@pytest.mark.parametrize("unicode", BOTH)
+def test_pending_and_running_glyphs_differ(unicode: bool) -> None:
+    table = _table(unicode)
+    assert table["pending"] != table["running"]
+
+
+# The agreed assignment, by character. Running is a block "occupying the slot",
+# pending the play triangle "queued to play next". Before this, running was the
+# triangle and pending `‖` / `|`.
+RUNNING = {True: "■", False: "#"}  # U+25A0 BLACK SQUARE, not U+23F8 (missing or wide)
+PENDING = {True: "▶", False: ">"}  # U+25B6
+UNCHANGED = {
+    True: {"ok": "✓", "failed": "✗", "skipped": "–"},
+    False: {"ok": "+", "failed": "x", "skipped": "-"},
+}
+
+
+@pytest.mark.parametrize("unicode", BOTH)
+def test_running_is_the_block(unicode: bool) -> None:
+    # Asserted on its own, not as "differs from pending": had only the pending
+    # entry been edited, running would still be the triangle and a
+    # difference-only check would pass.
+    assert _table(unicode)["running"] == RUNNING[unicode]
+
+
+@pytest.mark.parametrize("unicode", BOTH)
+def test_pending_is_the_play_triangle(unicode: bool) -> None:
+    # The other half of the swap, likewise on its own: had only the running
+    # entry been edited, pending would still be `‖` / `|`.
+    assert _table(unicode)["pending"] == PENDING[unicode]
+
+
+@pytest.mark.parametrize("unicode", BOTH)
+def test_running_no_longer_uses_the_glyph_that_now_means_pending(unicode: bool) -> None:
+    # The half-landed swap in which pending was edited but running was not
+    # leaves both on the triangle; `test_every_status_has_its_own_glyph` also
+    # catches it, but this names the failure.
+    assert _table(unicode)["running"] != PENDING[unicode]
+    assert _table(unicode)["pending"] != RUNNING[unicode]
+
+
+@pytest.mark.parametrize("unicode", BOTH)
+def test_finished_statuses_are_unaffected_by_the_swap(unicode: bool) -> None:
+    table = _table(unicode)
+    assert {st: table[st] for st in UNCHANGED[unicode]} == UNCHANGED[unicode]
+
+
+def test_status_vocabulary_is_block_versus_play() -> None:
+    """The whole agreed vocabulary, both tables. Pending was once `·` / `.`, then
+    `‖` / `|`; running was `▶` / `>` until it became the block."""
+    assert live._UNICODE_GLYPHS == {
+        "pending": "▶",
+        "running": "■",
+        "ok": "✓",
+        "failed": "✗",
+        "skipped": "–",
+    }
+    assert live._ASCII_GLYPHS == {
+        "pending": ">",
+        "running": "#",
+        "ok": "+",
+        "failed": "x",
+        "skipped": "-",
+    }
+
+
+@pytest.mark.parametrize("unicode", BOTH)
+def test_pending_is_not_a_dot(unicode: bool) -> None:
+    # The specific regression: a dot as the waiting mark is what made running
+    # tasks hard to spot. Any return to a dot-like glyph should be a decision.
+    assert _table(unicode)["pending"] not in {".", "·", "•", "∙", "⋅"}
+
+
+# -- glyphs as rendered: the chart and the header ----------------------------
+
+
+def _node_glyph(line: str, col: int, task_id: str) -> str:
+    """The first non-space character after `task_id` at `col`: its status glyph.
+
+    Chart nodes are `<n> <id padded to the column> <glyph>`.
+    """
+    rest = line[col + len(task_id) :].lstrip(" ")
+    assert rest, (task_id, line)
+    return rest[0]
+
+
+def _chart_glyph(snaps: list[TaskStream], task_id: str, unicode: bool) -> str:
+    lines = live._pert_lines(snaps, snaps[0].task_id, WIDE, unicode)
+    row, col = _at(lines, task_id)
+    return _node_glyph(lines[row], col, task_id)
+
+
+def _one_of_each() -> list[TaskStream]:
+    """Every status, each on its own task, two waves so the bar has a separator."""
+    return [
+        _task("alpha", "ok", wave=0),
+        _task("bravo", "failed", wave=0),
+        _task("charlie", "running", wave=0),
+        _task("delta", "pending", depends_on=("alpha",), wave=1),
+        _task("echo", "skipped", depends_on=("bravo",), wave=1),
+    ]
+
+
+@pytest.mark.parametrize("unicode", BOTH)
+def test_chart_draws_each_status_with_its_table_glyph(unicode: bool) -> None:
+    snaps = _one_of_each()
+    for s in snaps:
+        assert _chart_glyph(snaps, s.task_id, unicode) == _table(unicode)[s.status], s
+
+
+@pytest.mark.parametrize("unicode", BOTH)
+def test_chart_draws_running_as_block_and_pending_as_triangle(unicode: bool) -> None:
+    # By character, not through the table: a chart that kept a hard-coded copy
+    # of the old glyphs would agree with itself and still be wrong.
+    snaps = _one_of_each()
+    assert _chart_glyph(snaps, "charlie", unicode) == RUNNING[unicode]
+    assert _chart_glyph(snaps, "delta", unicode) == PENDING[unicode]
+
+
+@pytest.mark.parametrize("unicode", BOTH)
+def test_chart_draws_finished_tasks_as_before(unicode: bool) -> None:
+    snaps = _one_of_each()
+    drawn = {s.status: _chart_glyph(snaps, s.task_id, unicode) for s in snaps}
+    assert {st: drawn[st] for st in UNCHANGED[unicode]} == UNCHANGED[unicode]
+
+
+def _summary_glyph(snaps: list[TaskStream], task_id: str, unicode: bool) -> str:
+    """The glyph the one-line header gives the selected task: `[<n> <id> <glyph>]`."""
+    line = live._summary_line(snaps, task_id, WIDE, unicode)
+    match = re.search(rf"\[\d+ {re.escape(task_id)} (.)\]", line)
+    assert match, line
+    return match.group(1)
+
+
+@pytest.mark.parametrize("unicode", BOTH)
+def test_chart_and_summary_header_agree_on_each_tasks_glyph(unicode: bool) -> None:
+    snaps = _one_of_each()
+    for s in snaps:
+        chart = _chart_glyph(snaps, s.task_id, unicode)
+        assert _summary_glyph(snaps, s.task_id, unicode) == chart, s
+    # And the agreed glyph is the new one, so both cannot be wrong together.
+    assert _summary_glyph(snaps, "charlie", unicode) == RUNNING[unicode]
+    assert _summary_glyph(snaps, "delta", unicode) == PENDING[unicode]
+
+
+@pytest.mark.parametrize("unicode", BOTH)
+def test_summary_header_counts_use_the_chart_glyphs(unicode: bool) -> None:
+    # Two running, one pending: each count is prefixed by its status's glyph.
+    snaps = [
+        _task("a", "running"),
+        _task("b", "running"),
+        _task("c", "pending"),
+        _task("d", "ok"),
+    ]
+    line = live._summary_line(snaps, "a", WIDE, unicode)
+    assert f"{RUNNING[unicode]}2" in line, line
+    assert f"{PENDING[unicode]}1" in line, line
+    assert f"{UNCHANGED[unicode]['ok']}1" in line, line
+
+
+def _three_waves() -> list[TaskStream]:
+    return [
+        _task("north", "running", wave=0),
+        _task("south", "pending", depends_on=("north",), wave=1),
+        _task("west", "ok", depends_on=("south",), wave=2),
+    ]
+
+
+@pytest.mark.parametrize("unicode", BOTH)
+def test_roomy_header_draws_each_task_with_its_glyph(unicode: bool) -> None:
+    # With height to spare the header is the full chart, glyphs included.
+    snaps = _three_waves()
+    lines = live._header_lines(snaps, "west", WIDE, 40, unicode, True)
+    expected = {
+        "north": RUNNING[unicode],
+        "south": PENDING[unicode],
+        "west": UNCHANGED[unicode]["ok"],
+    }
+    for task_id, glyph in expected.items():
+        row, col = _at(lines, task_id)
+        assert _node_glyph(lines[row], col, task_id) == glyph, _show(lines)
+
+
+@pytest.mark.parametrize("unicode", BOTH)
+def test_one_line_header_draws_the_selection_with_the_chart_glyph(unicode: bool) -> None:
+    # Three waves cannot fit one line as a chart, so the header falls back to the
+    # summary line; the selection's glyph there is the one the chart draws.
+    snaps = _three_waves()
+    for s in snaps:
+        lines = live._header_lines(snaps, s.task_id, WIDE, 1, unicode, True)
+        assert lines == [live._summary_line(snaps, s.task_id, WIDE, unicode)], lines
+        assert _summary_glyph(snaps, s.task_id, unicode) == _chart_glyph(snaps, s.task_id, unicode)
+
+
+@pytest.mark.parametrize("unicode", BOTH)
+def test_running_and_pending_are_distinguishable_in_plain_chart_text(unicode: bool) -> None:
+    """No colour involved: the chart is plain text, and the characters alone must
+    tell a task that is working from one that is waiting."""
+    snaps = [
+        _task("north", "running", wave=0),
+        _task("south", "pending", wave=0),
+    ]
+    lines = live._pert_lines(snaps, "", WIDE, unicode)
+    _check_plain(lines, WIDE, unicode)
+    running = _chart_glyph(snaps, "north", unicode)
+    waiting = _chart_glyph(snaps, "south", unicode)
+    assert running != waiting, _show(lines)
+    # Both are visible marks, not blanks a glance could skip over.
+    assert not running.isspace() and not waiting.isspace(), _show(lines)
+
+
+@pytest.mark.parametrize("unicode", BOTH)
+def test_swapping_running_and_pending_changes_the_chart_only_at_the_glyphs(
+    unicode: bool,
+) -> None:
+    # Same ids, same layout; only which one is running differs. The two charts
+    # must differ, and only in the two glyph cells, so no column moved.
+    before = live._pert_lines(
+        [_task("north", "running"), _task("south", "pending")], "", WIDE, unicode
+    )
+    after = live._pert_lines(
+        [_task("north", "pending"), _task("south", "running")], "", WIDE, unicode
+    )
+    assert before != after, _show(before)
+    assert [len(line) for line in before] == [len(line) for line in after]
+    changed = [
+        (r, c)
+        for r, (a, b) in enumerate(zip(before, after, strict=True))
+        for c, (x, y) in enumerate(zip(a, b, strict=True))
+        if x != y
+    ]
+    assert len(changed) == 2, (_show(before), _show(after))
+
+
+@pytest.mark.parametrize("status", STATUSES)
+@pytest.mark.parametrize("unicode", BOTH)
+def test_glyph_width_does_not_move_chart_columns(unicode: bool, status: str) -> None:
+    # A column holding a task in `status` lines up the next wave exactly where a
+    # pending task would put it: every glyph occupies the same single cell.
+    def chart(first_status: str) -> list[str]:
+        snaps = [
+            _task("left", first_status, wave=0),
+            _task("right", "pending", depends_on=("left",), wave=1),
+        ]
+        return live._pert_lines(snaps, "", WIDE, unicode)
+
+    reference, lines = chart("pending"), chart(status)
+    assert _at(lines, "right") == _at(reference, "right"), (_show(reference), _show(lines))
+    assert [len(line) for line in lines] == [len(line) for line in reference]
