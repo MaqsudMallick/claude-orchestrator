@@ -234,8 +234,17 @@ async def run(
         hub=hub,
     )
     if hub is not None:
+        # The wave comes from the same grouping `--dry-run` prints, so the live
+        # view and the plan agree on which tasks run together.
+        wave_of = {tid: i for i, wave in enumerate(spec.waves()) for tid in wave}
         for task in spec.tasks:
-            hub.register(task.id, task.agent, model_for(spec.difficulty_for(task)))
+            hub.register(
+                task.id,
+                task.agent,
+                model_for(spec.difficulty_for(task)),
+                wave=wave_of[task.id],
+                depends_on=task.depends_on,
+            )
     ctx.log(f"run {ctx.run_id}: {len(spec.tasks)} task(s), max_parallel={max_parallel}")
     ctx.open_session(spec, spec_path, session_root)
 

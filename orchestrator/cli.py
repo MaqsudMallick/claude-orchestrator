@@ -1,4 +1,6 @@
-"""Command line entrypoint: `python -m orchestrator <spec.yaml>`.
+"""Command line entrypoint: the parser, its usage checks, and dispatch.
+
+Run with `python -m orchestrator <spec.yaml>`.
 
 Running a spec is the primary path. Recorded sessions are browsed with a small
 set of mutually exclusive flags (`--sessions`, `--session`, `--session-spec`,
@@ -7,8 +9,8 @@ bare `<spec.yaml>` positional without ambiguity (a spec file named `show`
 would suddenly mean something else), and every existing invocation must keep
 parsing exactly as before.
 
-This module is only the command line: the parser and the usage errors it
-reports. What a valid invocation then does lives in `commands`.
+What each invocation does lives in `commands`; this module stops at a parsed,
+checked `argparse.Namespace` and a loaded spec.
 """
 
 from __future__ import annotations
@@ -17,9 +19,9 @@ import argparse
 import sys
 from pathlib import Path
 
-from . import commands
 from . import session_store as store
 from . import spec as spec_mod
+from .commands import browse_sessions, run_spec
 
 # Options that only make sense when running a spec. Combining them with a
 # browse flag is almost certainly a mistake, so it is rejected, not ignored.
@@ -143,7 +145,7 @@ def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     if _check_args(parser, args):
-        return commands.browse_sessions(args)
+        return browse_sessions(args)
 
     try:
         spec = spec_mod.load(args.spec, project_dir=args.project_dir)
@@ -154,7 +156,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"invalid spec: {exc}", file=sys.stderr)
         return 2
 
-    return commands.run_spec(spec, args)
+    return run_spec(spec, args)
 
 
 if __name__ == "__main__":

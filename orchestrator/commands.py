@@ -39,20 +39,17 @@ LIVE_FALLBACK = "--live needs an interactive terminal; falling back to normal ou
 
 
 def plan_text(spec: spec_mod.Spec) -> str:
-    """Show the execution waves without spending anything."""
-    from graphlib import TopologicalSorter
+    """Show the execution waves without spending anything.
 
-    sorter = TopologicalSorter({t.id: set(t.depends_on) for t in spec.tasks})
-    sorter.prepare()
+    The grouping comes from `Spec.waves()`, the same one the live view is
+    given, so the plan printed here is the plan the run shows.
+    """
     by_id = spec.by_id
 
     lines = [f"{len(spec.tasks)} task(s) across these waves (tasks in a wave run in parallel):"]
-    wave = 0
-    while sorter.is_active():
-        ready = sorter.get_ready()
-        wave += 1
+    for wave, ids in enumerate(spec.waves(), start=1):
         lines.append(f"\n  wave {wave}:")
-        for tid in ready:
+        for tid in ids:
             t = by_id[tid]
             d = spec.difficulty_for(t)
             lines.append(
@@ -60,7 +57,6 @@ def plan_text(spec: spec_mod.Spec) -> str:
                 f"model={MODEL_BY_DIFFICULTY[d]}"
                 + ("  [worktree]" if t.isolate == "worktree" else "")
             )
-        sorter.done(*ready)
     return "\n".join(lines)
 
 

@@ -144,6 +144,32 @@ class Spec(BaseModel):
     def by_id(self) -> dict[str, Task]:
         return {t.id: t for t in self.tasks}
 
+    def waves(self) -> list[list[str]]:
+        """Task ids grouped into execution waves.
+
+        Ids in the same wave have no dependency between them and run
+        concurrently; every wave depends on the ones before it.
+
+        `get_ready()` hands back ids in whatever order the sorter's internal
+        bookkeeping produces, which depends on how nodes were first seen (a
+        dependency is registered when its dependent is added, not where it sits
+        in `tasks:`). Each wave is therefore re-sorted into spec order, so the
+        grouping a user sees is stable across runs and follows the file they
+        wrote.
+
+        No cycle handling: `_check_graph` has already rejected cyclic specs, so
+        `prepare()` cannot raise here.
+        """
+        position = {t.id: i for i, t in enumerate(self.tasks)}
+        sorter = TopologicalSorter({t.id: set(t.depends_on) for t in self.tasks})
+        sorter.prepare()
+        out: list[list[str]] = []
+        while sorter.is_active():
+            ready = sorted(sorter.get_ready(), key=position.__getitem__)
+            out.append(ready)
+            sorter.done(*ready)
+        return out
+
     @property
     def project_root(self) -> Path:
         """The directory the agents work in."""

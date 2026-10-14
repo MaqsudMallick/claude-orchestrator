@@ -38,7 +38,7 @@ from __future__ import annotations
 import threading
 import time
 from collections import deque
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from contextlib import AbstractContextManager, contextmanager
 from dataclasses import dataclass
 from typing import Literal
@@ -73,6 +73,8 @@ class TaskStream:
     pending: str  # trailing partial line, not yet newline-terminated
     updated_at: float
     unseen: int  # updates since this task was last marked seen
+    wave: int  # 0-based execution wave
+    depends_on: tuple[str, ...]  # task ids this one waits for
 
 
 class _State:
@@ -81,18 +83,23 @@ class _State:
     __slots__ = (
         "after_cr",
         "agent",
+        "depends_on",
         "lines",
         "model",
         "pending",
         "status",
         "unseen",
         "updated_at",
+        "wave",
     )
 
     def __init__(self, agent: str, model: str, scrollback: int) -> None:
         self.after_cr = False
         self.agent = agent
         self.model = model
+        # Graph shape. Defaults until a register() call carries the spec's values.
+        self.wave = 0
+        self.depends_on: tuple[str, ...] = ()
         self.status = "pending"
         self.lines: deque[str] = deque(maxlen=scrollback)
         self.pending = ""
@@ -133,6 +140,8 @@ class _State:
             pending=self.pending,
             updated_at=self.updated_at,
             unseen=self.unseen,
+            wave=self.wave,
+            depends_on=self.depends_on,  # already an immutable tuple
         )
 
 
@@ -166,15 +175,37 @@ class StreamHub:
 
     # -- publishing (event loop) ---------------------------------------------
 
-    def register(self, task_id: str, agent: str, model: str) -> None:
-        """Declare a task. Re-registering updates its labels and keeps its output."""
+    def register(
+        self,
+        task_id: str,
+        agent: str,
+        model: str,
+        wave: int | None = None,
+        depends_on: Sequence[str] | None = None,
+    ) -> None:
+        """Declare a task. Re-registering updates its labels and keeps its output.
+
+        A task is registered twice in a normal run: `graph.run` pre-registers
+        every task with its wave and dependencies, then the runner registers it
+        again with just the labels as it starts. So `None` for `wave` or
+        `depends_on` means "leave as is", not "reset": treating it as a reset
+        would wipe the graph shape at the moment the task starts running. The
+        defaults (wave 0, no dependencies) apply only to a brand-new task.
+
+        `depends_on` is copied into a tuple, so neither the caller's sequence
+        nor a snapshot's field can alias the hub's state.
+        """
         with self._lock:
             state = self._tasks.get(task_id)
             if state is None:
-                self._tasks[task_id] = _State(agent, model, self._scrollback)
+                state = self._tasks[task_id] = _State(agent, model, self._scrollback)
             else:
                 state.agent = agent
                 state.model = model
+            if wave is not None:
+                state.wave = wave
+            if depends_on is not None:
+                state.depends_on = tuple(depends_on)
 
     def publish(self, update: StreamUpdate) -> None:
         with self._lock:

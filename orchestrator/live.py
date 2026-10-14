@@ -7,8 +7,10 @@ and never publishes, so turning it off changes nothing about a run.
 Layout, top to bottom:
 
 - a tab bar of every task in registration order: number, id, status glyph, and
-  `*` when the task has output the user has not looked at yet;
-- an info row for the selected task (agent, model, status, follow mode);
+  `*` when the task has output the user has not looked at yet, with a separator
+  wherever the wave changes between neighbouring tabs (see `_draw_tabs`);
+- an info row for the selected task (agent, model, status, follow mode, and for
+  a task that has not started, the dependencies it is still waiting for);
 - the selected task's scrollback plus its in-progress `pending` line, hard
   wrapped to the window width, newest at the bottom;
 - the key legend.
@@ -64,8 +66,19 @@ _PAIR_FAILED = 2
 _PAIR_RUNNING = 3
 _PAIR_ACCENT = 4
 
+
 _LEGEND = "←/→ or 1-9 select   f follow   q quit"
 _LEGEND_ASCII = "<-/-> or 1-9 select   f follow   q quit"
+
+
+# Drawn between two neighbouring tabs from different waves.
+_WAVE_SEP = "│"
+_WAVE_SEP_ASCII = "|"
+
+# Statuses after which a task no longer holds up its dependents. A failed
+# dependency is "finished" too: its dependents are about to be skipped, and
+# listing it as something still awaited would suggest the wait could end well.
+_FINISHED = frozenset({"ok", "failed", "skipped"})
 
 
 def supported() -> bool:
@@ -274,7 +287,7 @@ class _Viewer:
         if rows >= 1:
             self._draw_tabs(snaps, cols)
         if rows >= 2:
-            self._draw_info(current, 1, cols)
+            self._draw_info(current, snaps, 1, cols)
         if rows >= 4:
             self._draw_body(current, 2, rows - 3, cols)
         if rows >= 3:
@@ -294,6 +307,21 @@ class _Viewer:
         return chosen
 
     def _draw_tabs(self, snaps: Sequence[TaskStream], cols: int) -> None:
+        """Draw the tab bar, with a separator wherever the wave changes.
+
+        Tabs stay in registration order and numbered by it, because that is the
+        order `_on_key` indexes: the tab labelled 3 is always the one `3`
+        selects, and left/right walk the bar left to right. So a wave forms one
+        visible group exactly when its tasks are contiguous in the spec (the
+        usual case); a spec that interleaves waves gets a separator at each
+        change rather than a reordered bar whose numbers no longer match keys.
+
+        Separators are shown only when the whole bar fits, separators included.
+        Once it does not, something is going to be cut off, and every column a
+        separator takes is one a task id could have used: an id you cannot read
+        costs more than a grouping you cannot see. Without separators the bar
+        scrolls exactly as it always has.
+        """
         import curses
 
         if not snaps:
@@ -311,7 +339,13 @@ class _Viewer:
             unseen = "*" if snap.unseen and snap.task_id != self.selected else " "
             labels.append(f" {prefix}{snap.task_id} {self._glyph(snap.status)}{unseen}")
         chosen = next(i for i, s in enumerate(snaps) if s.task_id == self.selected)
-        # Scroll the bar so the selected tab is always visible.
+        sep = _WAVE_SEP if self.unicode else _WAVE_SEP_ASCII
+        # Indexes of tabs that start a new wave and so get a separator before them.
+        wave_starts = {i for i in range(1, len(snaps)) if snaps[i].wave != snaps[i - 1].wave}
+        if sum(len(t) for t in labels) + len(sep) * len(wave_starts) > cols:
+            wave_starts = set()
+        # Scroll the bar so the selected tab is always visible. With separators
+        # on, the whole bar fits, so this never scrolls and they need no room.
         first = 0
         while first < chosen and sum(len(t) for t in labels[first : chosen + 1]) + 1 > cols:
             first += 1
@@ -321,6 +355,8 @@ class _Viewer:
         for i in range(first, len(snaps)):
             if x >= cols:
                 break
+            if i in wave_starts:
+                x = self._put(0, x, sep, cols, self._dim())
             snap, label = snaps[i], labels[i]
             base = curses.A_REVERSE | curses.A_BOLD if i == chosen else curses.A_NORMAL
             # Draw the glyph in its status colour, the rest in the tab style.
@@ -329,7 +365,9 @@ class _Viewer:
             x = self._put(0, x, label[glyph_at], cols, base | self._status_attr(snap.status))
             x = self._put(0, x, label[glyph_at + 1 :], cols, base | curses.A_BOLD)
 
-    def _draw_info(self, current: TaskStream | None, row: int, cols: int) -> None:
+    def _draw_info(
+        self, current: TaskStream | None, snaps: Sequence[TaskStream], row: int, cols: int
+    ) -> None:
         if current is None:
             return
         sep = " · " if self.unicode else " | "
@@ -337,6 +375,9 @@ class _Viewer:
         if current.agent or current.model:
             parts.append(" ".join(p for p in (current.agent, current.model) if p))
         parts.append(current.status)
+        waiting = _waiting_for(current, snaps)
+        if waiting:
+            parts.append("waiting for: " + ", ".join(waiting))
         if self.follow:
             parts.append("follow")
         x = self._put(row, 0, " " + sep.join(parts) + " ", cols, self._accent())
@@ -400,6 +441,20 @@ class _Viewer:
         import curses
 
         return curses.color_pair(pair) if curses.has_colors() else 0
+
+
+def _waiting_for(task: TaskStream, snaps: Sequence[TaskStream]) -> list[str]:
+    """Dependencies of a not-yet-started `task` that have not finished, in spec order.
+
+    Empty once the task has started (what it waited for no longer matters) and
+    when every dependency is done; a task that is still pending at that point is
+    waiting for a free slot, not for another task. A dependency the hub has
+    never heard of counts as unfinished: nothing says it has run.
+    """
+    if task.status != "pending" or not task.depends_on:
+        return []
+    status = {s.task_id: s.status for s in snaps}
+    return [dep for dep in task.depends_on if status.get(dep) not in _FINISHED]
 
 
 def _sanitize(line: str) -> str:

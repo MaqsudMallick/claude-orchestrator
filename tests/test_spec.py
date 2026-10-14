@@ -137,3 +137,69 @@ def test_defaults_difficulty_applies_to_tasks_that_omit_it(tmp_path):
     assert s.difficulty_for(s.by_id["cheap"]) == "easy"
     assert model_for(s.difficulty_for(s.by_id["cheap"])) == "claude-haiku-5-5"
     assert s.difficulty_for(s.by_id["pricey"]) == "hard"
+
+
+def test_waves_linear_chain_is_one_id_per_wave(tmp_path):
+    body = """
+    agents:
+      a: {system_prompt: x}
+    tasks:
+      - {id: one, agent: a, prompt: p}
+      - {id: two, agent: a, prompt: p, depends_on: [one]}
+      - {id: three, agent: a, prompt: p, depends_on: [two]}
+    """
+    s = spec_mod.load(write(tmp_path, body))
+    assert s.waves() == [["one"], ["two"], ["three"]]
+
+
+def test_waves_independent_tasks_share_a_wave(tmp_path):
+    body = """
+    agents:
+      a: {system_prompt: x}
+    tasks:
+      - {id: one, agent: a, prompt: p}
+      - {id: two, agent: a, prompt: p}
+      - {id: three, agent: a, prompt: p}
+    """
+    s = spec_mod.load(write(tmp_path, body))
+    assert s.waves() == [["one", "two", "three"]]
+
+
+def test_waves_diamond(tmp_path):
+    body = """
+    agents:
+      a: {system_prompt: x}
+    tasks:
+      - {id: schema, agent: a, prompt: p}
+      - {id: api, agent: a, prompt: p, depends_on: [schema]}
+      - {id: docs, agent: a, prompt: p, depends_on: [schema]}
+      - {id: tests, agent: a, prompt: p, depends_on: [api, docs]}
+    """
+    s = spec_mod.load(write(tmp_path, body))
+    assert s.waves() == [["schema"], ["api", "docs"], ["tests"]]
+
+
+def test_waves_order_within_a_wave_follows_spec_order(tmp_path):
+    # `late` is listed first and pulls `x` into the sorter before `first`, so
+    # the sorter alone would yield ["x", "first"]. Spec order puts `first` ahead.
+    body = """
+    agents:
+      a: {system_prompt: x}
+    tasks:
+      - {id: late, agent: a, prompt: p, depends_on: [x]}
+      - {id: first, agent: a, prompt: p}
+      - {id: x, agent: a, prompt: p}
+    """
+    s = spec_mod.load(write(tmp_path, body))
+    assert s.waves() == [["first", "x"], ["late"]]
+    # Not alphabetical either: reversing the listing reverses the wave.
+    body_rev = """
+    agents:
+      a: {system_prompt: x}
+    tasks:
+      - {id: x, agent: a, prompt: p}
+      - {id: first, agent: a, prompt: p}
+      - {id: late, agent: a, prompt: p, depends_on: [x]}
+    """
+    s = spec_mod.load(write(tmp_path, body_rev))
+    assert s.waves() == [["x", "first"], ["late"]]

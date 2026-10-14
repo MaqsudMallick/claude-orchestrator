@@ -194,6 +194,55 @@ def test_reregistering_updates_labels_and_keeps_output():
     assert (snap.agent, snap.model, snap.lines) == ("new", "m2", ["kept"])
 
 
+def test_first_registration_sets_wave_and_depends_on():
+    hub = StreamHub()
+    hub.register("api", "a", "m", wave=1, depends_on=["schema"])
+    snap = hub.snapshot("api")
+    assert (snap.wave, snap.depends_on) == (1, ("schema",))
+    assert isinstance(snap.depends_on, tuple)
+
+
+def test_first_registration_without_graph_shape_defaults_to_wave_zero_no_deps():
+    hub = StreamHub()
+    hub.register("t", "a", "m")
+    text(hub, "late", "x\n")  # implicit registration gets the same defaults
+    for tid in ("t", "late"):
+        snap = hub.snapshot(tid)
+        assert (snap.wave, snap.depends_on) == (0, ())
+
+
+def test_three_argument_reregistration_keeps_wave_and_depends_on():
+    # graph.run pre-registers with the spec; runner re-registers with labels only
+    # as the task starts. That second call must not reset the graph shape.
+    hub = StreamHub()
+    hub.register("api", "a", "m", wave=2, depends_on=["schema", "auth"])
+    hub.register("api", "b", "m2")
+    snap = hub.snapshot("api")
+    assert (snap.agent, snap.model) == ("b", "m2")
+    assert (snap.wave, snap.depends_on) == (2, ("schema", "auth"))
+
+
+def test_explicit_values_on_reregistration_update_the_graph_shape():
+    hub = StreamHub()
+    hub.register("api", "a", "m", wave=2, depends_on=["schema"])
+    hub.register("api", "a", "m", wave=3, depends_on=["docs"])
+    snap = hub.snapshot("api")
+    assert (snap.wave, snap.depends_on) == (3, ("docs",))
+
+    # An explicit empty sequence is a value, not "leave as is".
+    hub.register("api", "a", "m", wave=0, depends_on=[])
+    snap = hub.snapshot("api")
+    assert (snap.wave, snap.depends_on) == (0, ())
+
+
+def test_register_copies_the_callers_depends_on():
+    hub = StreamHub()
+    deps = ["schema"]
+    hub.register("api", "a", "m", depends_on=deps)
+    deps.append("injected")
+    assert hub.snapshot("api").depends_on == ("schema",)
+
+
 def test_publish_to_unregistered_task_registers_it_rather_than_dropping():
     hub = StreamHub()
     text(hub, "late", "hi\n")
@@ -221,6 +270,21 @@ def test_snapshot_is_a_copy():
     # And the hub moving on does not change a snapshot already taken.
     text(hub, "t", "c\n")
     assert again.lines == ["a", "b"]
+
+
+def test_snapshot_depends_on_cannot_affect_the_hub():
+    hub = StreamHub()
+    hub.register("api", "a", "m", wave=1, depends_on=["schema"])
+    snap = hub.snapshot("api")
+    assert isinstance(snap.depends_on, tuple)
+    with pytest.raises(AttributeError):
+        snap.depends_on.append("injected")  # type: ignore[attr-defined]
+    # Rebinding the field on the copy leaves the hub alone too.
+    snap.depends_on = ("other",)
+    snap.wave = 9
+
+    again = hub.snapshot("api")
+    assert (again.wave, again.depends_on) == (1, ("schema",))
 
 
 def test_snapshot_of_unknown_task_raises_keyerror():
