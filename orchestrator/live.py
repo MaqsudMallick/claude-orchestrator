@@ -67,19 +67,21 @@ _PAIR_RUNNING = 3
 _PAIR_ACCENT = 4
 
 
-def _legend(follow: bool, unicode: bool) -> str:
+def _legend(follow: bool, unicode: bool, show_tools: bool) -> str:
     """Return the key legend shown on the bottom row.
 
     The `f` entry names what pressing `f` will do next, not the current mode:
     the current mode is already shown on the info row, and a legend that said
     "follow" while following would read as an instruction to do what is already
     happening. The label is padded to the width of the longer word so `q quit`
-    stays put when the mode flips. Kept free of `self` and curses so it can be
-    tested without a terminal.
+    stays put when the mode flips. The `t` entry follows the same rule for the
+    same reasons: it says what `t` will do, and is padded to its longer label.
+    Kept free of `self` and curses so it can be tested without a terminal.
     """
     arrows = "←/→" if unicode else "<-/->"
     toggle = ("unfollow" if follow else "follow").ljust(len("unfollow"))
-    return f"{arrows} or 1-9 select   f {toggle}   q quit"
+    tools = ("hide tools" if show_tools else "tools").ljust(len("hide tools"))
+    return f"{arrows} or 1-9 select   f {toggle}   t {tools}   q quit"
 
 
 # Drawn between two neighbouring tabs from different waves.
@@ -142,6 +144,9 @@ class _Viewer:
         self.stop = stop
         self.selected: str | None = None
         self.follow = False
+        # Tool-call lines are hidden by default: they are mostly noise next to
+        # the model's own text. `t` reveals them (see `_draw_body`).
+        self.show_tools = False
         self.scr: curses.window | None = None
         self.unicode = (sys.stdout.encoding or "").lower().replace("-", "") == "utf8"
         self.glyphs = _UNICODE_GLYPHS if self.unicode else _ASCII_GLYPHS
@@ -267,6 +272,11 @@ class _Viewer:
         if key in (ord("f"), ord("F")):
             self.follow = not self.follow
             return
+        if key in (ord("t"), ord("T")):
+            # Changes what is drawn, not which task is watched, so unlike a
+            # manual selection this leaves follow mode alone.
+            self.show_tools = not self.show_tools
+            return
         ids = self.hub.task_ids()
         if not ids:
             return
@@ -302,7 +312,7 @@ class _Viewer:
         if rows >= 4:
             self._draw_body(current, 2, rows - 3, cols)
         if rows >= 3:
-            legend = _legend(self.follow, self.unicode)
+            legend = _legend(self.follow, self.unicode, self.show_tools)
             self._put(rows - 1, 0, legend, cols, self._dim())
         self.scr.refresh()
 
@@ -397,7 +407,12 @@ class _Viewer:
     def _draw_body(self, current: TaskStream | None, top: int, height: int, cols: int) -> None:
         if current is None or height <= 0 or cols <= 0:
             return
-        source = list(current.lines)
+        # Filter here, at draw time, rather than in the hub: the buffer keeps
+        # every line, so toggling `t` reveals tool lines already received, not
+        # just future ones. Only "tool" is hidden; "note" lines carry run-level
+        # events such as a failure's reason and must always stay visible.
+        source = [line.text for line in current.lines if self.show_tools or line.kind != "tool"]
+        # `pending` is always open model text: tool events are flushed whole.
         if current.pending:
             source.append(current.pending)
         # Wrap bottom-up and stop once the window is full: the scrollback can be

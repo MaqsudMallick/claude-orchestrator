@@ -22,8 +22,12 @@ Text normalization:
 - Non-text events (`tool`, `status`, `note`) are whole events, not fragments.
   Any in-progress text line is flushed first so the buffer stays in
   chronological order, then the event's text is appended as its own line(s).
-  Lines are stored verbatim with no kind marker: deciding how a tool call looks
-  is the viewer's job.
+  Each buffered `Line` records the kind of the update that produced it, so a
+  viewer can filter (e.g. hide tool calls) without parsing text. The text is
+  otherwise stored verbatim: deciding how a tool call looks is the viewer's job.
+- Lines of every kind occupy the ring buffer, including kinds a viewer hides by
+  default. Dropping hidden lines would save scrollback, but then toggling them
+  back on could not show anything retroactively; that trade is deliberate.
 - The ring buffer holds `scrollback` lines per task, and `pending` is
   hard-wrapped at `MAX_PENDING` characters, so output that never emits a
   newline is bounded too.
@@ -63,14 +67,28 @@ class StreamUpdate:
     at: float  # time.monotonic()
 
 
+@dataclass(frozen=True)
+class Line:
+    """One completed line in a task's buffer, tagged with where it came from.
+
+    Frozen so a snapshot's list can be copied shallowly: the hub and every
+    reader can share the same `Line` objects without one mutating another's.
+    """
+
+    kind: EventKind  # "text" | "tool" | "note"
+    text: str
+
+
 @dataclass
 class TaskStream:
     task_id: str
     agent: str
     model: str
     status: str  # pending | running | ok | failed | skipped
-    lines: list[str]  # snapshot of the ring buffer, oldest first
-    pending: str  # trailing partial line, not yet newline-terminated
+    lines: list[Line]  # snapshot of the ring buffer, oldest first
+    # Trailing partial line, not yet newline-terminated. A plain str rather than
+    # a `Line`: only text fragments are ever left open, so its kind is always "text".
+    pending: str
     updated_at: float
     unseen: int  # updates since this task was last marked seen
     wave: int  # 0-based execution wave
@@ -101,13 +119,18 @@ class _State:
         self.wave = 0
         self.depends_on: tuple[str, ...] = ()
         self.status = "pending"
-        self.lines: deque[str] = deque(maxlen=scrollback)
+        self.lines: deque[Line] = deque(maxlen=scrollback)
         self.pending = ""
         self.updated_at = time.monotonic()
         self.unseen = 0
 
-    def feed(self, text: str) -> None:
-        """Accumulate a text fragment, moving each completed line to the buffer."""
+    def feed(self, text: str, kind: EventKind = "text") -> None:
+        """Accumulate a fragment, moving each completed line to the buffer as `kind`.
+
+        `kind` is only ever non-text when `publish` brackets the call with
+        flushes, so `pending` never mixes text from two kinds: whatever this
+        call leaves there is completed by a flush with the same kind.
+        """
         if not text:
             return
         # A "\r\n" split across two fragments is one newline, not two.
@@ -117,17 +140,18 @@ class _State:
         parts = _normalize_newlines(text).split("\n")
         # Every part but the last was terminated by a newline in this fragment.
         for part in parts[:-1]:
-            self.lines.append(self.pending + part)
+            self.lines.append(Line(kind, self.pending + part))
             self.pending = ""
         self.pending += parts[-1]
         while len(self.pending) > MAX_PENDING:
-            self.lines.append(self.pending[:MAX_PENDING])
+            self.lines.append(Line(kind, self.pending[:MAX_PENDING]))
             self.pending = self.pending[MAX_PENDING:]
 
-    def flush(self) -> None:
+    def flush(self, kind: EventKind = "text") -> None:
+        """Close any open line into the buffer, recording it as `kind`."""
         self.after_cr = False
         if self.pending:
-            self.lines.append(self.pending)
+            self.lines.append(Line(kind, self.pending))
             self.pending = ""
 
     def snapshot(self, task_id: str) -> TaskStream:
@@ -213,9 +237,11 @@ class StreamHub:
             if update.kind == "text":
                 state.feed(update.text)
             else:
+                # The first flush closes open model text, so it stays "text";
+                # only the event's own lines take the event's kind.
                 state.flush()
-                state.feed(update.text)
-                state.flush()
+                state.feed(update.text, update.kind)
+                state.flush(update.kind)
             state.updated_at = update.at
             state.unseen += 1
 

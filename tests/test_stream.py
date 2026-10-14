@@ -27,12 +27,17 @@ from claude_agent_sdk import (
 )
 from orchestrator import graph, runner, stream
 from orchestrator import spec as spec_mod
-from orchestrator.stream import StreamHub, StreamUpdate
+from orchestrator.stream import Line, StreamHub, StreamUpdate
 
 
 def text(hub, task_id, *fragments):
     for f in fragments:
         hub.publish(StreamUpdate(task_id=task_id, kind="text", text=f, at=time.monotonic()))
+
+
+def texts(snap):
+    """The text of each buffered line, for tests that care about content, not kind."""
+    return [ln.text for ln in snap.lines]
 
 
 def run_in_thread(fn, timeout=2.0):
@@ -70,7 +75,7 @@ def test_fragments_accumulate_into_lines():
     hub = StreamHub()
     text(hub, "t", "He", "llo\nwor", "ld\n")
     snap = hub.snapshot("t")
-    assert snap.lines == ["Hello", "world"]
+    assert texts(snap) == ["Hello", "world"]
     assert snap.pending == ""
 
 
@@ -78,13 +83,13 @@ def test_trailing_fragment_stays_pending_and_is_not_lost():
     hub = StreamHub()
     text(hub, "t", "done\nhalf a li", "ne")
     snap = hub.snapshot("t")
-    assert snap.lines == ["done"]
+    assert texts(snap) == ["done"]
     assert snap.pending == "half a line"
 
     # It is completed by the next newline, not dropped or duplicated.
     text(hub, "t", " and the rest\n")
     snap = hub.snapshot("t")
-    assert snap.lines == ["done", "half a line and the rest"]
+    assert texts(snap) == ["done", "half a line and the rest"]
     assert snap.pending == ""
 
 
@@ -94,13 +99,66 @@ def test_non_text_event_flushes_pending_text_first():
     text(hub, "t", "let me look")
     hub.publish(StreamUpdate(task_id="t", kind="tool", text="Read", at=time.monotonic()))
     text(hub, "t", "found it\n")
-    assert hub.snapshot("t").lines == ["let me look", "Read", "found it"]
+    assert texts(hub.snapshot("t")) == ["let me look", "Read", "found it"]
+
+
+def test_text_fragments_produce_text_lines():
+    hub = StreamHub()
+    text(hub, "t", "He", "llo\nwor", "ld")
+    hub.publish(StreamUpdate(task_id="t", kind="tool", text="Read", at=time.monotonic()))
+    # Both the newline-completed line and the one closed by the tool's flush.
+    assert hub.snapshot("t").lines[:2] == [Line("text", "Hello"), Line("text", "world")]
+
+
+def test_tool_update_produces_a_tool_line():
+    hub = StreamHub()
+    text(hub, "t", "let me look")
+    hub.publish(StreamUpdate(task_id="t", kind="tool", text="Read", at=time.monotonic()))
+    text(hub, "t", "found it\n")
+    # The open text closed by the tool stays "text"; only the tool's own line is "tool".
+    assert hub.snapshot("t").lines == [
+        Line("text", "let me look"),
+        Line("tool", "Read"),
+        Line("text", "found it"),
+    ]
+
+
+def test_note_update_produces_note_lines():
+    hub = StreamHub()
+    hub.publish(StreamUpdate(task_id="t", kind="note", text="one\ntwo", at=time.monotonic()))
+    # Every line of a multi-line event carries its kind, including the last,
+    # which is completed by the trailing flush rather than a newline.
+    assert hub.snapshot("t").lines == [Line("note", "one"), Line("note", "two")]
+
+
+def test_wrapped_long_event_keeps_its_kind():
+    hub = StreamHub()
+    long = "y" * (stream.MAX_PENDING + 5)
+    hub.publish(StreamUpdate(task_id="t", kind="tool", text=long, at=time.monotonic()))
+    snap = hub.snapshot("t")
+    assert {ln.kind for ln in snap.lines} == {"tool"}
+    assert "".join(texts(snap)) == long
+    assert snap.pending == ""
+
+
+def test_hidden_kinds_still_occupy_the_ring_buffer():
+    # Deliberate: tool lines are kept even though a viewer may hide them, so
+    # toggling them on can show them retroactively. They count against scrollback.
+    hub = StreamHub(scrollback=3)
+    text(hub, "t", "a\n")
+    for name in ("Read", "Grep", "Edit"):
+        hub.publish(StreamUpdate(task_id="t", kind="tool", text=name, at=time.monotonic()))
+    assert hub.snapshot("t").lines == [
+        Line("tool", "Read"),
+        Line("tool", "Grep"),
+        Line("tool", "Edit"),
+    ]
 
 
 def test_crlf_split_across_fragments_is_one_newline():
     hub = StreamHub()
     text(hub, "t", "a\r", "\nb\r\n", "c\rd\n")
-    assert hub.snapshot("t").lines == ["a", "b", "c", "d"]
+    assert texts(hub.snapshot("t")) == ["a", "b", "c", "d"]
 
 
 def test_output_without_newlines_is_bounded():
@@ -109,7 +167,7 @@ def test_output_without_newlines_is_bounded():
     snap = hub.snapshot("t")
     assert len(snap.pending) <= stream.MAX_PENDING
     # Wrapped, not truncated: every character is still there.
-    assert "".join(snap.lines) + snap.pending == "x" * (stream.MAX_PENDING * 2 + 10)
+    assert "".join(texts(snap)) + snap.pending == "x" * (stream.MAX_PENDING * 2 + 10)
 
 
 # --- ring buffer -----------------------------------------------------------
@@ -118,15 +176,15 @@ def test_output_without_newlines_is_bounded():
 def test_ring_buffer_keeps_the_most_recent_lines():
     hub = StreamHub(scrollback=3)
     text(hub, "t", *(f"line {i}\n" for i in range(10)))
-    assert hub.snapshot("t").lines == ["line 7", "line 8", "line 9"]
+    assert texts(hub.snapshot("t")) == ["line 7", "line 8", "line 9"]
 
 
 def test_ring_buffer_bound_is_per_task():
     hub = StreamHub(scrollback=2)
     text(hub, "a", "a1\na2\na3\n")
     text(hub, "b", "b1\n")
-    assert hub.snapshot("a").lines == ["a2", "a3"]
-    assert hub.snapshot("b").lines == ["b1"]
+    assert texts(hub.snapshot("a")) == ["a2", "a3"]
+    assert texts(hub.snapshot("b")) == ["b1"]
 
 
 def test_scrollback_must_be_positive():
@@ -149,7 +207,7 @@ def test_unseen_counts_updates_and_mark_seen_resets_it():
     hub.mark_seen("t")
     assert hub.snapshot("t").unseen == 0
     # Output is untouched by marking seen.
-    assert hub.snapshot("t").lines == ["one two"]
+    assert texts(hub.snapshot("t")) == ["one two"]
 
     text(hub, "t", "more\n")
     assert hub.snapshot("t").unseen == 1
@@ -191,7 +249,7 @@ def test_reregistering_updates_labels_and_keeps_output():
     text(hub, "t", "kept\n")
     hub.register("t", "new", "m2")
     snap = hub.snapshot("t")
-    assert (snap.agent, snap.model, snap.lines) == ("new", "m2", ["kept"])
+    assert (snap.agent, snap.model, texts(snap)) == ("new", "m2", ["kept"])
 
 
 def test_first_registration_sets_wave_and_depends_on():
@@ -247,7 +305,7 @@ def test_publish_to_unregistered_task_registers_it_rather_than_dropping():
     hub = StreamHub()
     text(hub, "late", "hi\n")
     assert hub.task_ids() == ["late"]
-    assert hub.snapshot("late").lines == ["hi"]
+    assert texts(hub.snapshot("late")) == ["hi"]
 
 
 # --- snapshots -------------------------------------------------------------
@@ -257,19 +315,19 @@ def test_snapshot_is_a_copy():
     hub = StreamHub()
     text(hub, "t", "a\nb\n")
     snap = hub.snapshot("t")
-    snap.lines.append("injected")
-    snap.lines[0] = "changed"
+    snap.lines.append(Line("text", "injected"))
+    snap.lines[0] = Line("tool", "changed")
     snap.unseen = 99
     snap.status = "ok"
 
     again = hub.snapshot("t")
-    assert again.lines == ["a", "b"]
+    assert texts(again) == ["a", "b"]
     assert again.unseen == 1  # one publish, however many lines it carried
     assert again.status == "pending"
 
     # And the hub moving on does not change a snapshot already taken.
     text(hub, "t", "c\n")
-    assert again.lines == ["a", "b"]
+    assert texts(again) == ["a", "b"]
 
 
 def test_snapshot_depends_on_cannot_affect_the_hub():
@@ -323,8 +381,8 @@ def test_snapshot_taken_mid_publish_is_self_consistent(fast_switching):
         while not done.is_set() or checked == 0:
             snap = hub.snapshot("t")
             n = len(snap.lines)
-            if snap.lines != [line(i) for i in range(n)]:
-                problems.append(("lines", n, snap.lines[-3:]))
+            if texts(snap) != [line(i) for i in range(n)]:
+                problems.append(("lines", n, texts(snap)[-3:]))
             if n < n_lines and not (line(n) + "\n").startswith(snap.pending):
                 problems.append(("pending", n, snap.pending))
             consumed = sum(len(f) for f in fragments[: snap.unseen])
@@ -343,7 +401,7 @@ def test_snapshot_taken_mid_publish_is_self_consistent(fast_switching):
     checks = [p for p in problems if p[0] == "checked"]
     assert [p for p in problems if p[0] != "checked"] == []
     assert checks and checks[0][1] > 0
-    assert hub.snapshot("t").lines == [line(i) for i in range(n_lines)]
+    assert texts(hub.snapshot("t")) == [line(i) for i in range(n_lines)]
 
 
 # --- thread safety ---------------------------------------------------------
@@ -375,9 +433,9 @@ def test_concurrent_whole_line_publishes_lose_nothing_and_do_not_interleave(fast
         f"w{w}-{i:04d}-" + "abcdefghij" * 3 for w in range(n_threads) for i in range(per_thread)
     }
     assert len(snap.lines) == len(expected)
-    assert set(snap.lines) == expected
+    assert set(texts(snap)) == expected
     for w in range(n_threads):
-        mine = [ln for ln in snap.lines if ln.startswith(f"w{w}-")]
+        mine = [ln for ln in texts(snap) if ln.startswith(f"w{w}-")]
         assert mine == sorted(mine)
 
 
@@ -404,7 +462,7 @@ def test_concurrent_fragment_streams_to_separate_tasks_stay_separate(fast_switch
     assert sorted(hub.task_ids()) == sorted(f"t{w}" for w in range(n_threads))
     for w in range(n_threads):
         snap = hub.snapshot(f"t{w}")
-        assert snap.lines == [f"task{w} line {i:04d}" for i in range(per_thread)]
+        assert texts(snap) == [f"task{w} line {i:04d}" for i in range(per_thread)]
         assert snap.pending == ""
 
 
@@ -651,12 +709,12 @@ def test_run_with_a_hub_streams_each_task_into_it(stubbed, long_ack_timeout):
     assert (one.agent, one.status) == ("a", "ok")
     assert one.model
     # The open line "world" is closed at block stop, before the tool line.
-    assert one.lines == ["Hello", "world", "Read"]
+    assert one.lines == [Line("text", "Hello"), Line("text", "world"), Line("tool", "Read")]
     assert one.pending == ""
 
     broken = hub.snapshot("broken")
     assert broken.status == "failed"
-    assert any("cwd does not exist" in ln for ln in broken.lines)
+    assert any("cwd does not exist" in ln for ln in texts(broken))
     assert hub.snapshot("after").status == "skipped"
     # The question ran with no viewer attached and did not leave a suspension open.
     assert not hub.suspend_requested()

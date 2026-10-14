@@ -2,8 +2,10 @@
 and the "waiting for" list on the info row.
 
 The curses session itself (`_Viewer`) is not driven here: it needs a real
-terminal, and this suite runs without one. Everything below is a plain function
-of its arguments, so these tests need neither a terminal nor curses.
+terminal, and this suite runs without one. Apart from a few checks on
+`_Viewer`'s key-toggled state (constructor and `_on_key` only, which never open
+a screen), everything below is a plain function of its arguments, so these tests
+need neither a terminal nor a curses screen.
 
 `live` is imported as a module and helpers are looked up on it per test, so a
 helper that is missing fails only the tests that use it rather than the whole
@@ -13,12 +15,14 @@ file at collection time.
 import re
 import sys
 
+import anyio
 import pytest
 from orchestrator import live
-from orchestrator.stream import TaskStream
+from orchestrator.stream import StreamHub, TaskStream
 
 BOTH = [pytest.param(True, id="unicode"), pytest.param(False, id="ascii")]
 FOLLOW = [pytest.param(True, id="follow-on"), pytest.param(False, id="follow-off")]
+TOOLS = [pytest.param(True, id="tools-shown"), pytest.param(False, id="tools-hidden")]
 
 
 def _has_word(text: str, phrase: str) -> bool:
@@ -30,49 +34,61 @@ def _has_word(text: str, phrase: str) -> bool:
 # -- _legend -----------------------------------------------------------------
 
 
+@pytest.mark.parametrize("show_tools", TOOLS)
 @pytest.mark.parametrize("unicode", BOTH)
-def test_legend_with_follow_on_offers_unfollow(unicode: bool) -> None:
-    text = live._legend(follow=True, unicode=unicode)
+def test_legend_with_follow_on_offers_unfollow(unicode: bool, show_tools: bool) -> None:
+    text = live._legend(follow=True, unicode=unicode, show_tools=show_tools)
     assert _has_word(text, "f unfollow")
     # The bug being fixed: the legend kept offering to turn follow on when it
     # already was. "f follow" as its own phrase must be gone, not merely joined.
     assert not _has_word(text, "f follow")
 
 
+@pytest.mark.parametrize("show_tools", TOOLS)
 @pytest.mark.parametrize("unicode", BOTH)
-def test_legend_with_follow_off_offers_follow_and_not_unfollow(unicode: bool) -> None:
-    text = live._legend(follow=False, unicode=unicode)
+def test_legend_with_follow_off_offers_follow_and_not_unfollow(
+    unicode: bool, show_tools: bool
+) -> None:
+    text = live._legend(follow=False, unicode=unicode, show_tools=show_tools)
     assert _has_word(text, "f follow")
     # `"follow" in text` is true in both states; only the negative tells them apart.
     assert "unfollow" not in text
 
 
+@pytest.mark.parametrize("show_tools", TOOLS)
 @pytest.mark.parametrize("unicode", BOTH)
-def test_legend_differs_between_follow_states(unicode: bool) -> None:
-    assert live._legend(follow=True, unicode=unicode) != live._legend(follow=False, unicode=unicode)
+def test_legend_differs_between_follow_states(unicode: bool, show_tools: bool) -> None:
+    assert live._legend(follow=True, unicode=unicode, show_tools=show_tools) != live._legend(
+        follow=False, unicode=unicode, show_tools=show_tools
+    )
 
 
+@pytest.mark.parametrize("show_tools", TOOLS)
 @pytest.mark.parametrize("follow", FOLLOW)
-def test_legend_ascii_variant_is_pure_ascii(follow: bool) -> None:
-    text = live._legend(follow=follow, unicode=False)
+def test_legend_ascii_variant_is_pure_ascii(follow: bool, show_tools: bool) -> None:
+    text = live._legend(follow=follow, unicode=False, show_tools=show_tools)
     assert text.isascii(), [c for c in text if not c.isascii()]
     assert "<-/->" in text
     # And printable: a control byte would be just as bad on a dumb terminal.
     assert text.isprintable()
 
 
+@pytest.mark.parametrize("show_tools", TOOLS)
 @pytest.mark.parametrize("follow", FOLLOW)
-def test_legend_unicode_variant_uses_arrow_glyphs(follow: bool) -> None:
-    text = live._legend(follow=follow, unicode=True)
+def test_legend_unicode_variant_uses_arrow_glyphs(follow: bool, show_tools: bool) -> None:
+    text = live._legend(follow=follow, unicode=True, show_tools=show_tools)
     assert "←/→" in text
     assert "<-/->" not in text
     assert text.isprintable()
 
 
+@pytest.mark.parametrize("show_tools", TOOLS)
 @pytest.mark.parametrize("unicode", BOTH)
 @pytest.mark.parametrize("follow", FOLLOW)
-def test_legend_mentions_select_keys_and_quit(follow: bool, unicode: bool) -> None:
-    text = live._legend(follow=follow, unicode=unicode)
+def test_legend_mentions_select_keys_and_quit(
+    follow: bool, unicode: bool, show_tools: bool
+) -> None:
+    text = live._legend(follow=follow, unicode=unicode, show_tools=show_tools)
     assert "1-9" in text
     assert "select" in text
     assert _has_word(text, "q")
@@ -81,21 +97,22 @@ def test_legend_mentions_select_keys_and_quit(follow: bool, unicode: bool) -> No
     assert "\n" not in text
 
 
+@pytest.mark.parametrize("show_tools", TOOLS)
 @pytest.mark.parametrize("unicode", BOTH)
 @pytest.mark.parametrize("follow", FOLLOW)
-def test_legend_is_deterministic(follow: bool, unicode: bool) -> None:
-    assert live._legend(follow=follow, unicode=unicode) == live._legend(
-        follow=follow, unicode=unicode
+def test_legend_is_deterministic(follow: bool, unicode: bool, show_tools: bool) -> None:
+    assert live._legend(follow=follow, unicode=unicode, show_tools=show_tools) == live._legend(
+        follow=follow, unicode=unicode, show_tools=show_tools
     )
 
 
 def test_legend_does_not_depend_on_call_order() -> None:
     """No hidden state: the answer for one combination is unaffected by earlier calls."""
-    combos = [(f, u) for f in (True, False) for u in (True, False)]
+    combos = [(f, u, t) for f in (True, False) for u in (True, False) for t in (True, False)]
     first = {c: live._legend(*c) for c in combos}
     second = {c: live._legend(*c) for c in reversed(combos)}
     assert first == second
-    assert len(set(first.values())) == 4  # every combination is distinguishable
+    assert len(set(first.values())) == 8  # every combination is distinguishable
 
 
 def test_legend_needs_no_terminal(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -116,8 +133,114 @@ def test_legend_needs_no_terminal(monkeypatch: pytest.MonkeyPatch) -> None:
             raise AssertionError("_legend wrote to stdout")
 
     monkeypatch.setattr(sys, "stdout", _NotATty())
-    assert _has_word(live._legend(follow=True, unicode=True), "f unfollow")
-    assert _has_word(live._legend(follow=False, unicode=False), "f follow")
+    assert _has_word(live._legend(follow=True, unicode=True, show_tools=True), "f unfollow")
+    assert _has_word(live._legend(follow=False, unicode=False, show_tools=False), "f follow")
+    assert _has_word(live._legend(follow=False, unicode=False, show_tools=False), "t tools")
+
+
+# -- _legend: the tools toggle -------------------------------------------------
+
+
+@pytest.mark.parametrize("unicode", BOTH)
+@pytest.mark.parametrize("follow", FOLLOW)
+def test_legend_with_tools_hidden_offers_tools_and_not_hide(follow: bool, unicode: bool) -> None:
+    text = live._legend(follow=follow, unicode=unicode, show_tools=False)
+    assert _has_word(text, "t tools")
+    # Like `f`, the entry names what `t` will do. With tools already hidden,
+    # offering to hide them would be wrong, so "hide" must not appear at all.
+    assert "hide" not in text
+
+
+@pytest.mark.parametrize("unicode", BOTH)
+@pytest.mark.parametrize("follow", FOLLOW)
+def test_legend_with_tools_shown_offers_hide_tools(follow: bool, unicode: bool) -> None:
+    text = live._legend(follow=follow, unicode=unicode, show_tools=True)
+    assert _has_word(text, "t hide tools")
+    # "t tools" as its own phrase must be gone, not merely sit beside "hide".
+    assert not _has_word(text, "t tools")
+
+
+@pytest.mark.parametrize("unicode", BOTH)
+@pytest.mark.parametrize("follow", FOLLOW)
+def test_legend_differs_between_tools_states(follow: bool, unicode: bool) -> None:
+    assert live._legend(follow=follow, unicode=unicode, show_tools=True) != live._legend(
+        follow=follow, unicode=unicode, show_tools=False
+    )
+
+
+@pytest.mark.parametrize("unicode", BOTH)
+@pytest.mark.parametrize("follow", FOLLOW)
+def test_legend_tools_toggle_does_not_change_the_follow_entry(follow: bool, unicode: bool) -> None:
+    """The two toggles are independent: flipping `t` leaves the `f` entry's wording alone."""
+    phrase = "f unfollow" if follow else "f follow"
+    for show_tools in (True, False):
+        assert _has_word(
+            live._legend(follow=follow, unicode=unicode, show_tools=show_tools), phrase
+        )
+
+
+# -- _Viewer state: tools hidden by default, `t` toggles ----------------------
+#
+# Only the constructor and `_on_key` are used: neither touches the terminal
+# (`_on_key` imports the curses module for its key constants but never calls
+# `initscr`). Drawing is not exercised; see the note on filtering below.
+
+
+def _viewer() -> live._Viewer:
+    return live._Viewer(StreamHub(), anyio.Event())
+
+
+def test_viewer_hides_tool_lines_by_default() -> None:
+    # The whole user-visible point of the change: a fresh viewer shows the
+    # model's text without tool-call noise until the user asks for it.
+    assert _viewer().show_tools is False
+
+
+def test_fresh_viewer_legend_offers_to_show_tools() -> None:
+    """What the user actually sees on first draw, built the way `_draw` builds it."""
+    v = _viewer()
+    text = live._legend(v.follow, v.unicode, v.show_tools)
+    assert _has_word(text, "t tools")
+    assert "hide" not in text
+
+
+@pytest.mark.parametrize("key", ["t", "T"])
+def test_t_toggles_show_tools_on_and_off(key: str) -> None:
+    v = _viewer()
+    v._on_key(ord(key))
+    assert v.show_tools is True
+    v._on_key(ord(key))
+    assert v.show_tools is False
+
+
+@pytest.mark.parametrize("key", ["t", "T"])
+@pytest.mark.parametrize("follow", FOLLOW)
+def test_t_leaves_follow_mode_alone(key: str, follow: bool) -> None:
+    hub = StreamHub()
+    hub.register("a", agent="", model="")
+    hub.register("b", agent="", model="")
+    v = live._Viewer(hub, anyio.Event())
+    v.follow = follow
+    v.selected = "b"
+    v._on_key(ord(key))
+    assert v.show_tools is True
+    # Unlike picking a task by hand, revealing tools does not mean "stay here".
+    assert v.follow is follow
+    assert v.selected == "b"
+
+
+def test_f_does_not_touch_show_tools() -> None:
+    v = _viewer()
+    v._on_key(ord("t"))
+    v._on_key(ord("f"))
+    assert v.show_tools is True
+    assert v.follow is True
+
+
+# Filtering itself (tool lines skipped unless `show_tools`, note lines always
+# kept) is done inline in `_Viewer._draw_body`, which writes straight to the
+# curses window through `_put`. There is no pure helper to call, so it is not
+# tested here rather than tested through a fake screen.
 
 
 # -- _sanitize ---------------------------------------------------------------
