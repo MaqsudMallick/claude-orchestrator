@@ -7,10 +7,12 @@ and never publishes, so turning it off changes nothing about a run.
 Layout, top to bottom:
 
 - a tab bar of every task in registration order: number, id, status glyph, and
-  `*` when the task has output the user has not looked at yet, with a separator
-  wherever the wave changes between neighbouring tabs (see `_draw_tabs`);
-- an info row for the selected task (agent, model, status, follow mode, and for
-  a task that has not started, the dependencies it is still waiting for);
+  `*` when the task has output the user has not looked at yet, with each wave
+  group introduced by a `w<n>` label and a separator wherever the wave changes
+  between neighbouring tabs, both dropped as the window narrows (see `_draw_tabs`);
+- an info row for the selected task (agent, model, status, its wave and the
+  tasks sharing it, follow mode, and for a task that has not started, the
+  dependencies it is still waiting for);
 - the selected task's scrollback plus its in-progress `pending` line, hard
   wrapped to the window width, newest at the bottom;
 - the key legend.
@@ -328,7 +330,7 @@ class _Viewer:
         return chosen
 
     def _draw_tabs(self, snaps: Sequence[TaskStream], cols: int) -> None:
-        """Draw the tab bar, with a separator wherever the wave changes.
+        """Draw the tab bar, with a wave label and separator wherever the wave changes.
 
         Tabs stay in registration order and numbered by it, because that is the
         order `_on_key` indexes: the tab labelled 3 is always the one `3`
@@ -337,11 +339,19 @@ class _Viewer:
         usual case); a spec that interleaves waves gets a separator at each
         change rather than a reordered bar whose numbers no longer match keys.
 
-        Separators are shown only when the whole bar fits, separators included.
-        Once it does not, something is going to be cut off, and every column a
-        separator takes is one a task id could have used: an id you cannot read
-        costs more than a grouping you cannot see. Without separators the bar
-        scrolls exactly as it always has.
+        The grouping is drawn at up to three levels, the richest that lets the
+        whole bar fit:
+
+        1. a `w<n>` label before each group plus a separator between groups;
+        2. separators only: they still show where a boundary is, just not which
+           wave it opens, which is the cheaper thing to lose;
+        3. neither, and the bar scrolls exactly as it always has.
+
+        Task ids are never shortened to make room for either. Once the bar does
+        not fit, something is going to be cut off, and every column the grouping
+        takes is one a task id could have used: an id you cannot read costs more
+        than a grouping you cannot see. A run with a single wave has no
+        boundaries, so it gets no labels either: `w1` alone says nothing.
         """
         import curses
 
@@ -363,10 +373,18 @@ class _Viewer:
         sep = _WAVE_SEP if self.unicode else _WAVE_SEP_ASCII
         # Indexes of tabs that start a new wave and so get a separator before them.
         wave_starts = {i for i in range(1, len(snaps)) if snaps[i].wave != snaps[i - 1].wave}
-        if sum(len(t) for t in labels) + len(sep) * len(wave_starts) > cols:
-            wave_starts = set()
+        # Wave labels go before every group, the first included, but only when
+        # there is more than one group to tell apart.
+        wave_tags = {i: f" w{snaps[i].wave + 1}" for i in {0, *wave_starts}} if wave_starts else {}
+        tabs_width = sum(len(t) for t in labels)
+        seps_width = len(sep) * len(wave_starts)
+        if tabs_width + seps_width + sum(len(t) for t in wave_tags.values()) > cols:
+            wave_tags = {}
+            if tabs_width + seps_width > cols:
+                wave_starts = set()
         # Scroll the bar so the selected tab is always visible. With separators
-        # on, the whole bar fits, so this never scrolls and they need no room.
+        # or labels on, the whole bar fits, so this never scrolls and they need
+        # no room.
         first = 0
         while first < chosen and sum(len(t) for t in labels[first : chosen + 1]) + 1 > cols:
             first += 1
@@ -378,6 +396,8 @@ class _Viewer:
                 break
             if i in wave_starts:
                 x = self._put(0, x, sep, cols, self._dim())
+            if i in wave_tags:
+                x = self._put(0, x, wave_tags[i], cols, self._dim())
             snap, label = snaps[i], labels[i]
             base = curses.A_REVERSE | curses.A_BOLD if i == chosen else curses.A_NORMAL
             # Draw the glyph in its status colour, the rest in the tab style.
@@ -396,6 +416,11 @@ class _Viewer:
         if current.agent or current.model:
             parts.append(" ".join(p for p in (current.agent, current.model) if p))
         parts.append(current.status)
+        # `wave` is 0-based on the stream; people count waves from 1.
+        parts.append(f"wave {current.wave + 1} of {max(s.wave for s in snaps) + 1}")
+        alongside = _runs_with(current, snaps)
+        if alongside:
+            parts.append("runs with: " + ", ".join(alongside))
         waiting = _waiting_for(current, snaps)
         if waiting:
             parts.append("waiting for: " + ", ".join(waiting))
@@ -481,6 +506,18 @@ def _waiting_for(task: TaskStream, snaps: Sequence[TaskStream]) -> list[str]:
         return []
     status = {s.task_id: s.status for s in snaps}
     return [dep for dep in task.depends_on if status.get(dep) not in _FINISHED]
+
+
+def _runs_with(current: TaskStream, snaps: Sequence[TaskStream]) -> list[str]:
+    """Ids of the other tasks in `current`'s wave, in bar (registration) order.
+
+    These are the tasks the DAG allows to run at the same time as `current`,
+    which is what the tab bar's grouping only hints at when the spec
+    interleaves waves or the window is too narrow for separators. It says
+    nothing about whether they are running right now: that is the glyphs' job,
+    and a wave whose concurrency is capped may run its members one at a time.
+    """
+    return [s.task_id for s in snaps if s.wave == current.wave and s.task_id != current.task_id]
 
 
 def _sanitize(line: str) -> str:

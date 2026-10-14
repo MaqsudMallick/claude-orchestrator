@@ -1,5 +1,5 @@
 """The live viewer's pure helpers: the key legend, line sanitising and wrapping,
-and the "waiting for" list on the info row.
+and the "waiting for" and "runs with" lists on the info row.
 
 The curses session itself (`_Viewer`) is not driven here: it needs a real
 terminal, and this suite runs without one. Apart from a few checks on
@@ -319,7 +319,12 @@ def test_wrap_rows_fit_and_rejoin_to_the_original(width: int) -> None:
 # -- _waiting_for ------------------------------------------------------------
 
 
-def _task(task_id: str, status: str = "pending", depends_on: tuple[str, ...] = ()) -> TaskStream:
+def _task(
+    task_id: str,
+    status: str = "pending",
+    depends_on: tuple[str, ...] = (),
+    wave: int = 0,
+) -> TaskStream:
     return TaskStream(
         task_id=task_id,
         agent="",
@@ -329,7 +334,7 @@ def _task(task_id: str, status: str = "pending", depends_on: tuple[str, ...] = (
         pending="",
         updated_at=0.0,
         unseen=0,
-        wave=0,
+        wave=wave,
         depends_on=depends_on,
     )
 
@@ -368,3 +373,73 @@ def test_waiting_for_is_empty_once_the_task_has_started(status: str) -> None:
 def test_waiting_for_is_empty_without_dependencies() -> None:
     task = _task("a")
     assert live._waiting_for(task, [task]) == []
+
+
+# -- _runs_with --------------------------------------------------------------
+#
+# `snaps` is in bar order (the order tabs are drawn), so every expected list
+# below is written in the order its tasks appear in `snaps`. Ids are chosen so
+# that bar order is never alphabetical order, so a sorted result would fail.
+
+
+def test_runs_with_lists_both_wave_mates_in_bar_order() -> None:
+    snaps = [_task("zeta", wave=1), _task("alpha", wave=1), _task("mid", wave=1)]
+    assert live._runs_with(snaps[1], snaps) == ["zeta", "mid"]
+    assert live._runs_with(snaps[0], snaps) == ["alpha", "mid"]
+    assert live._runs_with(snaps[2], snaps) == ["zeta", "alpha"]
+
+
+def test_runs_with_is_empty_for_a_task_alone_in_its_wave() -> None:
+    snaps = [_task("a", wave=0), _task("solo", wave=1), _task("c", wave=2), _task("d", wave=2)]
+    assert live._runs_with(snaps[1], snaps) == []
+
+
+def test_runs_with_is_empty_when_the_task_is_the_only_one() -> None:
+    task = _task("only", wave=0)
+    assert live._runs_with(task, [task]) == []
+
+
+@pytest.mark.parametrize("position", [0, 1, 2, 3])
+def test_runs_with_never_lists_the_task_itself(position: int) -> None:
+    # The off-by-one this guards against would put "runs with: <itself>" on
+    # screen. Checked from every slot, including the first and last, where an
+    # index-based slice is most likely to slip.
+    snaps = [_task(t, wave=3) for t in ("d", "b", "a", "c")]
+    current = snaps[position]
+    result = live._runs_with(current, snaps)
+    assert current.task_id not in result
+    assert result == [s.task_id for s in snaps if s is not current]
+
+
+def test_runs_with_excludes_other_waves_on_both_sides_of_the_bar() -> None:
+    # Neighbouring tabs from waves 0 and 2 sit right against wave 1's edges.
+    snaps = [
+        _task("w0", wave=0),
+        _task("first", wave=1),
+        _task("second", wave=1),
+        _task("w2", wave=2),
+    ]
+    assert live._runs_with(snaps[1], snaps) == ["second"]
+    assert live._runs_with(snaps[2], snaps) == ["first"]
+
+
+def test_runs_with_skips_an_adjacent_task_from_another_wave_when_waves_interleave() -> None:
+    # A spec that interleaves waves puts a different-wave task between two
+    # wave-mates. It is adjacent to both and must still be left out, while the
+    # non-adjacent wave-mate is found.
+    snaps = [_task("x", wave=0), _task("y", wave=1), _task("z", wave=0)]
+    assert live._runs_with(snaps[0], snaps) == ["z"]
+    assert live._runs_with(snaps[2], snaps) == ["x"]
+    assert live._runs_with(snaps[1], snaps) == []
+
+
+def test_runs_with_ignores_status_and_dependencies() -> None:
+    # Wave membership alone decides it: a finished or pending wave-mate, or one
+    # that depends on nothing in common, still ran in the same wave.
+    snaps = [
+        _task("a", "ok", wave=1),
+        _task("b", "running", wave=1, depends_on=("root",)),
+        _task("c", "failed", wave=1),
+        _task("d", "skipped", wave=1),
+    ]
+    assert live._runs_with(snaps[1], snaps) == ["a", "c", "d"]
