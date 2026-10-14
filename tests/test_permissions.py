@@ -1,4 +1,4 @@
-from orchestrator.permissions import check_denied
+from orchestrator.policy import check_denied
 
 
 def roots(tmp_path):

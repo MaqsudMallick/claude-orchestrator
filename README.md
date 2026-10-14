@@ -222,6 +222,94 @@ gets a git worktree on branch `orch/<run-id>/<task-id>`, under
 when the run ends — removing them would throw away the work. Merge or delete
 them yourself, or pass `--cleanup-worktrees`.
 
+## Watching a run live
+
+With parallel tasks, the line-by-line output interleaves and is hard to follow.
+`--live` opens a full-screen view of one task's output as it is generated, with
+a tab bar of every task across the top:
+
+```bash
+uv run orchestrator spec.yaml --live -j 4
+```
+
+| Key | Action |
+|---|---|
+| `←` / `→` | previous / next task |
+| `1`–`9` | switch to that task |
+| `f` | toggle follow mode, which selects the most recently active task |
+| `q` | detach |
+
+A tab shows the task's status and a marker when it has output you have not
+seen yet.
+
+Limits and behaviour:
+
+- **Detaching does not cancel anything.** `q` leaves the view and the run keeps
+  going to completion.
+- **It needs a real terminal.** When stdout is piped or redirected, `--live`
+  prints one line saying it is falling back and runs with the normal output.
+  It never fails the run, so it is safe in CI.
+- **Questions take the screen.** When a task asks a clarifying question, the
+  view steps aside so the prompt is readable, then returns once you answer.
+- **Scrollback is bounded.** Each task keeps its most recent 500 lines; older
+  output scrolls away. The full output is still in the session record (see
+  below).
+- `--live` cannot be combined with `--quiet`.
+
+## Session records
+
+Each run is written to disk as it goes, so you can read it back after the
+terminal is gone. Recording makes no API calls and adds no spend.
+
+Per run, the store keeps:
+
+- `spec.yaml`: the spec, byte for byte, plus the planned task list in the header
+- `events.jsonl`: one JSON object per line. A `begin` line first, then one
+  `task` line per task as it finishes (status, reason, cost, turns, duration,
+  the prompt as written, the full output, review rounds, questions and answers,
+  denied tool calls), then an `end` line with the run totals. A run that never
+  finished has no `end` line.
+
+Each run gets its own directory, `<root>/<UTC timestamp>-<run-id>/`. The root is
+the first of these that applies:
+
+1. the `root=` argument to the Python API
+2. `$ORCHESTRATOR_SESSION_DIR`
+3. `$XDG_DATA_HOME/claude-orchestrator/sessions`
+4. `~/.local/share/claude-orchestrator/sessions`
+
+Directories are created `0700` and files `0600`.
+
+**Nothing is redacted or truncated.** If a task read a file containing
+secrets, the text can end up in `events.jsonl`. Sessions are never pruned
+automatically, so delete the directories you no longer need. If a line is
+damaged, for example by a crash mid-write, it is skipped and listed in
+`Session.warnings`; the rest of the run still loads. If a task is recorded
+twice, the later line wins.
+
+To revisit a past run from Python:
+
+```python
+from orchestrator.session_store import list_sessions, load_session, load_task
+
+sessions = list_sessions()  # newest first
+for s in sessions:
+    print(s.run_id, s.finished, s.total_cost_usd)
+
+session = load_session(sessions[0].run_id)  # a unique prefix also works
+task = load_task(session.run_id, "api")
+print(task.status, task.total_cost_usd)
+print(task.text)  # the full output
+```
+
+Or read `events.jsonl` directly. Each task is one JSON line, so `jq` can
+select them:
+
+```bash
+jq -r 'select(.kind=="task") | .text' events.jsonl
+jq -c 'select(.kind=="task") | {task_id, status, total_cost_usd}' events.jsonl
+```
+
 ## Notes on the SDK (verified against claude-agent-sdk 0.2.166)
 
 - `AskUserQuestion` does reach `can_use_tool`, and answers are accepted as

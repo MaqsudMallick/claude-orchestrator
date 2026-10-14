@@ -90,7 +90,7 @@ def test_override_of_a_missing_dir_still_fails(tmp_path):
 def test_sibling_task_dirs_are_separate_write_sandboxes(tmp_path):
     """Documented behaviour: a task's sandbox is its own cwd, not the whole
     project, so sibling tasks cannot write over each other."""
-    from orchestrator.permissions import check_denied
+    from orchestrator.policy import check_denied
 
     (tmp_path / "repo" / "services" / "api").mkdir(parents=True)
     (tmp_path / "repo" / "services" / "web").mkdir(parents=True)
@@ -104,7 +104,7 @@ def test_sibling_task_dirs_are_separate_write_sandboxes(tmp_path):
 
 
 def test_allowed_write_dirs_widens_the_sandbox_across_the_project(tmp_path):
-    from orchestrator.permissions import check_denied
+    from orchestrator.policy import check_denied
 
     (tmp_path / "repo" / "shared").mkdir(parents=True)
     s = spec_mod.load(write(tmp_path, pd="./repo"))

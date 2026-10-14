@@ -3,12 +3,19 @@
 Each task is a full session rather than a Task-tool subagent, because subagents
 cannot reach AskUserQuestion. The agent's persona and toolset become session
 options; the difficulty alias picks the model.
+
+When the run has a `StreamHub` (`ctx.hub`), the task also reports to it as it
+goes: its status, its assistant text token by token, each tool it calls, and
+notes for review rounds and failures. The hub is purely additive. With no hub
+the session is opened exactly as before, without partial-message streaming, so
+a headless run does not pay for traffic nobody reads.
 """
 
 from __future__ import annotations
 
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 from claude_agent_sdk import (
@@ -16,14 +23,19 @@ from claude_agent_sdk import (
     ClaudeAgentOptions,
     ClaudeSDKClient,
     ResultMessage,
+    StreamEvent,
     TextBlock,
+    ToolUseBlock,
 )
 
+from . import stream_adapter, workspace
 from . import worktree as wt
 from .models import model_for
 from .permissions import make_callback
 from .review import run_reviews
 from .spec import Spec, Task
+from .stream import StreamHub
+from .workspace import Workspace, WorkspaceError
 
 
 @dataclass
@@ -81,40 +93,98 @@ def build_prompt(task: Task, spec: Spec, results: dict[str, TaskResult]) -> str:
     )
 
 
+class _ReviewContext:
+    """The run context as seen by `run_reviews`, with its log lines mirrored to the hub.
+
+    review.py reports each review and fix round through `ctx.log` the moment it
+    finishes. Mirroring those lines as notes gives the live view each verdict
+    as it happens, without review.py needing to know a hub exists. Every other
+    attribute is the real context's.
+    """
+
+    def __init__(self, ctx: Any, hub: StreamHub, task_id: str) -> None:
+        self._ctx = ctx
+        self._hub = hub
+        self._task_id = task_id
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._ctx, name)
+
+    def log(self, msg: str) -> None:
+        self._ctx.log(msg)
+        prefix = f"[{self._task_id}] "
+        stream_adapter.note(self._hub, self._task_id, msg.removeprefix(prefix))
+
+
 async def run_task(task: Task, spec: Spec, results: dict[str, TaskResult], ctx: Any) -> TaskResult:
+    """Run one task and, if it has a hub, keep the hub's view of it current.
+
+    A task that is cancelled (Ctrl-C) or escapes a step with an exception is
+    marked failed on the way out, so the view never shows it `running` after
+    it has stopped.
+    """
     difficulty = spec.difficulty_for(task)
     model = model_for(difficulty)
-    started = time.monotonic()
-
-    result = TaskResult(task_id=task.id, status="failed", model=model, difficulty=difficulty)
-
-    base_cwd = spec.resolve_cwd(task)
-    created: wt.Worktree | None = None
+    hub: StreamHub | None = ctx.hub
+    _hub_started(hub, task, model)
     try:
-        if task.isolate == "worktree":
-            created = wt.create(base_cwd, task.id, ctx.run_id)
-            ctx.worktrees.append(created)
-            cwd = created.path
-            result.branch = created.branch
-            result.worktree_repo = str(created.repo)
+        started = time.monotonic()
+        result = TaskResult(task_id=task.id, status="failed", model=model, difficulty=difficulty)
+        try:
+            ws = workspace.prepare(task, spec, ctx.run_id)
+        except WorkspaceError as exc:
+            _record_workspace(result, ctx, exc.cwd, exc.worktree)
+            result.reason = str(exc)
+            result.duration_s = time.monotonic() - started
         else:
-            cwd = base_cwd
-    except wt.WorktreeError as exc:
-        result.reason = f"worktree setup failed: {exc}"
-        result.duration_s = time.monotonic() - started
-        return result
+            _record_workspace(result, ctx, ws.cwd, ws.worktree)
+            options = build_options(task, spec, model, ws, ctx.ask_lock, result, hub)
+            prompt = build_prompt(task, spec, results)
+            await execute_session(task, prompt, options, difficulty, result, ctx, hub, started)
+            await review_and_finalise(task, spec, result, ws.cwd, ctx, hub, started)
+    except BaseException:
+        if hub is not None:
+            hub.set_status(task.id, "failed")
+        raise
+    _hub_finished(hub, task.id, result)
+    return result
 
-    result.cwd = str(cwd)
-    if not cwd.exists():
-        result.reason = f"cwd does not exist: {cwd}"
-        result.duration_s = time.monotonic() - started
-        return result
 
-    roots = [
-        cwd.resolve(),
-        *spec.allowed_write_roots(),
-    ]
+def _hub_started(hub: StreamHub | None, task: Task, model: str) -> None:
+    if hub is not None:
+        hub.register(task.id, task.agent, model)
+        hub.set_status(task.id, "running")
 
+
+def _hub_finished(hub: StreamHub | None, task_id: str, result: TaskResult) -> None:
+    if hub is not None:
+        if not result.ok and result.reason:
+            stream_adapter.note(hub, task_id, result.reason)
+        hub.set_status(task_id, result.status)
+
+
+def _record_workspace(
+    result: TaskResult, ctx: Any, cwd: Path | None, created: wt.Worktree | None
+) -> None:
+    """Note where the task ran on its result, and register any worktree for cleanup."""
+    if created is not None:
+        ctx.worktrees.append(created)
+        result.branch = created.branch
+        result.worktree_repo = str(created.repo)
+    if cwd is not None:
+        result.cwd = str(cwd)
+
+
+def build_options(
+    task: Task,
+    spec: Spec,
+    model: str,
+    ws: Workspace,
+    ask_lock: Any,
+    result: TaskResult,
+    hub: StreamHub | None,
+) -> ClaudeAgentOptions:
+    """Session options for `task`, recording its questions and denials on `result`."""
     agent = spec.agents[task.agent]
     tools = None
     if agent.tools is not None:
@@ -122,56 +192,66 @@ async def run_task(task: Task, spec: Spec, results: dict[str, TaskResult], ctx: 
         # which would silently disable clarifying questions for this agent.
         tools = list(dict.fromkeys([*agent.tools, "AskUserQuestion"]))
 
-    options = ClaudeAgentOptions(
+    return ClaudeAgentOptions(
         model=model,
         system_prompt=agent.system_prompt,
         tools=tools,
-        cwd=str(cwd),
+        cwd=str(ws.cwd),
         permission_mode="default",
         can_use_tool=make_callback(
             task_id=task.id,
             agent=task.agent,
-            roots=roots,
-            lock=ctx.ask_lock,
+            roots=ws.roots,
+            lock=ask_lock,
             allow_push=spec.defaults.allow_push,
             on_question=lambda tid, qs, ans: result.questions.append(
                 {"questions": qs, "answers": ans}
             ),
             on_deny=lambda tid, reason: result.denials.append(reason),
+            hub=hub,
         ),
         max_turns=spec.max_turns_for(task),
         effort=spec.effort_for(task),
         max_budget_usd=task.max_budget_usd,
+        include_partial_messages=hub is not None,
     )
 
-    prompt = build_prompt(task, spec, results)
+
+async def execute_session(
+    task: Task,
+    prompt: str,
+    options: ClaudeAgentOptions,
+    difficulty: str,
+    result: TaskResult,
+    ctx: Any,
+    hub: StreamHub | None,
+    started: float,
+) -> None:
+    """Run the session to completion, recording its outcome on `result`."""
     ctx.log(
-        f"[{task.id}] start  agent={task.agent} difficulty={difficulty} model={model} cwd={cwd}"
+        f"[{task.id}] start  agent={task.agent} difficulty={difficulty} "
+        f"model={options.model} cwd={options.cwd}"
     )
 
+    # True while the last text published to the hub has not ended its line.
+    line_open = False
     try:
         async with ClaudeSDKClient(options=options) as client:
             await client.query(prompt)
             async for msg in client.receive_response():
+                if isinstance(msg, StreamEvent) and hub is not None:
+                    line_open = stream_adapter.stream_event(hub, task.id, msg.event, line_open)
                 if isinstance(msg, AssistantMessage) and ctx.verbose:
                     for block in msg.content:
                         if isinstance(block, TextBlock) and block.text.strip():
                             ctx.log(f"[{task.id}] {block.text.strip()[:300]}")
+                if isinstance(msg, AssistantMessage) and hub is not None:
+                    # Text is not published here: it already arrived as deltas.
+                    for block in msg.content:
+                        if isinstance(block, ToolUseBlock):
+                            stream_adapter.tool(hub, task.id, block.name)
                 if isinstance(msg, ResultMessage):
-                    result.text = msg.result or ""
-                    result.cost_usd = msg.total_cost_usd or 0.0
-                    result.num_turns = msg.num_turns
-                    result.stop_reason = msg.stop_reason
-                    result.session_id = msg.session_id
-                    result.subtype = msg.subtype
-                    if msg.is_error:
-                        # is_error also covers non-crash cutoffs such as
-                        # max_turns, so carry the detail through to the report.
-                        result.status = "failed"
-                        detail = ", ".join(msg.errors or []) or msg.subtype or "unknown"
-                        result.reason = f"{detail} (stop_reason={msg.stop_reason})"
-                    else:
-                        result.status = "ok"
+                    _record_result_message(result, msg)
     except Exception as exc:  # noqa: BLE001 - one task must not kill the run
         result.status = "failed"
         result.reason = f"{type(exc).__name__}: {exc}"
@@ -181,8 +261,40 @@ async def run_task(task: Task, spec: Spec, results: dict[str, TaskResult], ctx: 
         f"${result.cost_usd:.4f}" + (f"  ({result.reason})" if result.reason else "")
     )
 
+
+def _record_result_message(result: TaskResult, msg: ResultMessage) -> None:
+    result.text = msg.result or ""
+    result.cost_usd = msg.total_cost_usd or 0.0
+    result.num_turns = msg.num_turns
+    result.stop_reason = msg.stop_reason
+    result.session_id = msg.session_id
+    result.subtype = msg.subtype
+    if msg.is_error:
+        # is_error also covers non-crash cutoffs such as
+        # max_turns, so carry the detail through to the report.
+        result.status = "failed"
+        detail = ", ".join(msg.errors or []) or msg.subtype or "unknown"
+        result.reason = f"{detail} (stop_reason={msg.stop_reason})"
+    else:
+        result.status = "ok"
+
+
+async def review_and_finalise(
+    task: Task,
+    spec: Spec,
+    result: TaskResult,
+    cwd: Path,
+    ctx: Any,
+    hub: StreamHub | None,
+    started: float,
+) -> None:
+    """Review a successful task's work, then stamp the task's total duration."""
     if result.ok:
-        outcome = await run_reviews(task, spec, result, cwd, ctx)
+        review_ctx: Any = ctx
+        if hub is not None and spec.review_for(task).enabled:
+            stream_adapter.note(hub, task.id, "review: started")
+            review_ctx = _ReviewContext(ctx, hub, task.id)
+        outcome = await run_reviews(task, spec, result, cwd, review_ctx)
         result.reviews = outcome.rounds
         result.review_cost_usd = outcome.cost_usd
         result.review_verdict = outcome.verdict if outcome.rounds else ""
@@ -191,4 +303,3 @@ async def run_task(task: Task, spec: Spec, results: dict[str, TaskResult], ctx: 
         # the outstanding findings are still visible.
 
     result.duration_s = time.monotonic() - started
-    return result

@@ -39,6 +39,54 @@ Just do the work yourself when:
 A good signal: sketch the dependency edges first. If the graph is a straight
 line, write the code instead.
 
+## Architect it yourself; the spec carries the design
+
+**Never put an architect, designer or "decide the approach" task in the spec.**
+Do that work now, before writing any YAML, and write the decisions into the
+task prompts as fixed interfaces: module paths, function names and signatures,
+file formats, on-disk layouts, which file each task owns.
+
+This is not a style preference. A design task is the worst possible fit for this
+tool:
+
+- Its output reaches dependents as **summary text, truncated at
+  `max_context_chars`**. Three tasks coding against a clipped list of function
+  signatures will each invent a different missing half, and the mismatch only
+  surfaces when their files are imported together.
+- Every implementation task has to wait for it, so the graph collapses to a line
+  and the parallelism you came here for disappears.
+- It has none of your conversation with the user. You know what they actually
+  asked for; a sub-session gets a paragraph.
+- Design is the part a user most wants a say in. Routing it through a session
+  they are not watching hides exactly the decision they would have wanted to
+  make.
+
+So resolve the design questions **with the user, at plan time**, then hand the
+tasks a contract:
+
+```yaml
+# Not this:
+- id: design
+  prompt: Design the session storage format and summarise the API.
+
+# This:
+- id: store
+  prompt: |
+    Implement `orchestrator/session_store.py` with exactly this API:
+      begin(project_root: Path, run_id: str, spec_text: str) -> Path
+      record_task(project_root: Path, run_id: str, record: TaskRecord) -> None
+      load_session(project_root: Path, run_id: str) -> Session
+    Records live in <project_root>/.orchestrator/sessions/<run_id>/, one JSON
+    file per task so an interrupted run still reads back.
+```
+
+The second form lets the tasks that consume the API start without waiting, and
+it lets you notice a hole in your own design while it is still free to change.
+
+If writing those signatures shows you do not yet understand the problem well
+enough to specify it, that is the signal to go and read the code yourself - not
+to delegate the confusion to a task.
+
 ## Build the graph from real blockers
 
 Add an edge only where a task genuinely cannot start without its upstream's
@@ -109,9 +157,9 @@ downstream task inherits nothing.
 
 ```yaml
 prompt: |
-  Design the database schema for a link shortener and write it to schema.sql.
-  Finish by summarising each table and its columns, so the API task can work
-  from your summary without re-reading the file.
+  Implement the endpoints in app.py against the schema in schema.sql.
+  Finish by listing each endpoint, its method, path and response shape, so the
+  test task can work from your summary without re-reading the file.
 ```
 
 For large artifacts, hand off a **path**, not the content - tasks sharing a cwd
@@ -119,8 +167,12 @@ can read each other's files, and that sidesteps the character cap entirely:
 
 ```yaml
 prompt: |
-  Read schema.sql (written by the schema task) and implement the endpoints.
+  Read schema.sql (written by the migration task) and implement the endpoints.
 ```
+
+Note what is being handed off in both cases: **what was built**, not **what was
+decided**. Decisions belong in the spec you wrote; only results flow between
+tasks.
 
 ## Let tasks ask
 
@@ -130,19 +182,24 @@ nothing will make a task guess silently and commit the guess to disk.
 
 ```yaml
 agents:
-  db-architect:
+  backend-dev:
     system_prompt: |
-      You are a database architect.
-      If a requirement is ambiguous in a way that would change the schema, use
-      the AskUserQuestion tool before committing to a design. A wrong guess here
-      propagates into every downstream task.
+      You are a backend engineer.
+      If you hit an ambiguity the spec does not settle, and guessing would be
+      expensive to unwind, use the AskUserQuestion tool rather than picking for
+      the user.
 ```
 
-Put this on the tasks where a wrong assumption is expensive - usually the `hard`
-ones at the top of the graph. Do not put it on every task, or a wide run will
-block on a queue of trivia. Questions from parallel tasks are serialized and
-labelled with the task id, so they never interleave, but the human still answers
-them one at a time.
+Note the division of labour. **Design ambiguity is yours to resolve with the
+user before the run** - that is the previous section. What is left for a task to
+ask about is what only becomes visible once it is in the code: an existing
+convention that contradicts the spec, a dependency that is not installed, two
+callers that disagree. If you find yourself writing "ask the user how this
+should work", you have left architecture in the spec; go and decide it.
+
+Do not put this on every agent, or a wide run will block on a queue of trivia.
+Questions from parallel tasks are serialized and labelled with the task id, so
+they never interleave, but the human still answers them one at a time.
 
 If an agent restricts `tools:`, `AskUserQuestion` is re-added automatically, so
 a tools allowlist cannot silently disable asking.
@@ -216,42 +273,48 @@ defaults:
   allow_push: false
 
 agents:
-  db-architect:
-    description: Designs data models.
-    system_prompt: |
-      You are a database architect. Ask before guessing on anything that would
-      change the schema.
-    tools: [Read, Write, Edit, Bash, Glob, Grep]   # omit for every tool
   backend-dev:
-    description: Implements endpoints.
+    description: Implements against a given interface.
     system_prompt: You are a backend engineer. Match the conventions already here.
-    tools: [Read, Write, Edit, Bash, Glob, Grep]
+    tools: [Read, Write, Edit, Bash, Glob, Grep]   # omit for every tool
   writer:
     description: Writes documentation.
     system_prompt: You are a technical writer. Concise, no marketing language.
     tools: [Read, Write, Glob, Grep]
 
+# No design task: the schema below was decided while writing this spec, which
+# is why `migrate` and `docs` can start at the same time.
 tasks:
-  - id: schema
-    agent: db-architect
-    difficulty: hard
+  - id: migrate
+    agent: backend-dev
     prompt: |
-      Design the schema and write schema.sql. Finish by summarising each table.
+      Write schema.sql creating exactly these tables:
+        links(id TEXT PRIMARY KEY, target TEXT NOT NULL,
+              owner_id TEXT NOT NULL, created_at TIMESTAMP NOT NULL)
+        clicks(id INTEGER PRIMARY KEY, link_id TEXT REFERENCES links(id),
+               at TIMESTAMP NOT NULL, referrer TEXT)
+      Finish by confirming what you created.
 
   - id: api
     agent: backend-dev
-    difficulty: medium
-    depends_on: [schema]
-    prompt: Implement the endpoints described above.
+    depends_on: [migrate]
+    prompt: |
+      Implement app.py against schema.sql with POST /links, GET /{id} and
+      GET /links/{id}/stats. Finish by listing each endpoint and its response
+      shape.
 
   - id: docs
     agent: writer
     difficulty: easy
-    depends_on: [schema]
-    prompt: Document the data model for a new contributor.
+    prompt: |
+      Document this data model for a new contributor:
+        links(id, target, owner_id, created_at)
+        clicks(id, link_id, at, referrer)
 ```
 
-Here `api` and `docs` run concurrently after `schema`.
+`migrate` and `docs` start together in wave 1, and `api` follows `migrate`.
+`docs` has no dependency because the schema was decided here, in the spec -
+with a design task at the top, all three would have queued behind it.
 
 ## Before you run it
 
@@ -266,6 +329,21 @@ cycle caught here is free, and the same mistake caught at runtime is not.
 
 Read the wave output as a plan review, not just a validation pass: it is the
 cheapest moment to notice you have serialised something.
+
+For a wide run, where several tasks in one wave stream output at once, suggest
+`--live` to the user (`uv run orchestrator spec.yaml --live -j 4`). It shows one
+task at a time with a tab per task, which is far easier to follow than
+interleaved output. It needs a real terminal and falls back to normal output
+when piped, so do not suggest it for CI.
+
+## Past runs are recorded
+
+Every run writes its spec and per-task results to a session directory, and
+`orchestrator.session_store` can list and load them. This is useful when
+planning a follow-up: before writing a new spec, look at what a similar run
+actually cost per task, which tasks failed and why, and what each task produced in full. It is also the
+place to check a `hard` task's output after the run, without re-running it. Records are not redacted, so do not paste
+their contents into anything shared without checking first.
 
 ## Things that will bite you
 
@@ -302,3 +380,9 @@ and move tiers down where the output did not need the thinking.
 8. Is review on for the tasks whose mistakes are expensive, and off for the
    ones where it would just double the bill?
 9. Does `--dry-run` show the width you expected?
+
+And the one that invalidates the rest if you get it wrong:
+
+0. Is there a design, architecture or "decide the approach" task in this spec?
+   If so, delete it, make those decisions yourself, and write them into the
+   prompts as fixed interfaces.
