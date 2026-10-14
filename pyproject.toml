@@ -11,6 +11,10 @@ dependencies = [
     "pydantic>=2.0",
     "pyyaml>=6.0",
     "anyio>=4.0",
+    # Parses and wraps markdown for the live body; curses still does the drawing.
+    "rich>=13.0",
+    # richtext.py reparses with raw HTML disabled; rich depends on it anyway.
+    "markdown-it-py>=2.2",
 ]
 
 [project.scripts]
