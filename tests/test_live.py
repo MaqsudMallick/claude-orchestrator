@@ -14,6 +14,7 @@ file at collection time.
 
 import re
 import sys
+from collections.abc import Callable
 
 import anyio
 import pytest
@@ -443,3 +444,256 @@ def test_runs_with_ignores_status_and_dependencies() -> None:
         _task("d", "skipped", wave=1),
     ]
     assert live._runs_with(snaps[1], snaps) == ["a", "c", "d"]
+
+
+# -- _pert_lines -------------------------------------------------------------
+#
+# The chart is a pure function of the snapshots, so everything below reads the
+# plain text it returns. Ids are whole words that never prefix one another or
+# any word the chart itself prints ("wave", "terminal", "narrow", ...), so a
+# whole-word search finds each node exactly and a truncated id is detectable.
+# Bar order is deliberately not alphabetical within a wave.
+
+# Wide enough that nothing should need to degrade.
+WIDE = 200
+
+_BOX_CORNERS_AND_VERTICALS = set("┐┘┌└┴┬├┤┼│╮╯╭╰╴╵╶╷")
+
+
+def _two_waves() -> list[TaskStream]:
+    """Fan-in: [[loader, tests], [verify]], the layout drawn in specs/pert-chart.yaml."""
+    return [
+        _task("loader", "running", wave=0),
+        _task("tests", "ok", wave=0),
+        _task("verify", "pending", depends_on=("loader", "tests"), wave=1),
+    ]
+
+
+def _three_waves() -> list[TaskStream]:
+    """Fan-out and fan-in, plus one dependency (fetch -> report) that skips a column."""
+    return [
+        _task("fetch", "ok", wave=0),
+        _task("parse", "failed", wave=0),
+        _task("index", "running", wave=0),
+        _task("merge", "skipped", depends_on=("fetch", "parse"), wave=1),
+        _task("audit", "pending", depends_on=("index",), wave=1),
+        _task("report", "pending", depends_on=("merge", "audit", "fetch"), wave=2),
+    ]
+
+
+Graph = Callable[[], list[TaskStream]]
+GRAPHS = [pytest.param(_two_waves, id="two-wave"), pytest.param(_three_waves, id="three-wave")]
+
+
+def _find(lines: list[str], word: str) -> list[tuple[int, int]]:
+    """(row, column) of every whole-word occurrence of `word` in the chart."""
+    pat = re.compile(rf"(?<![\w-]){re.escape(word)}(?![\w-])")
+    return [(r, m.start()) for r, line in enumerate(lines) for m in pat.finditer(line)]
+
+
+def _at(lines: list[str], word: str) -> tuple[int, int]:
+    found = _find(lines, word)
+    assert len(found) == 1, (word, found, lines)
+    return found[0]
+
+
+def _show(lines: list[str]) -> str:
+    """Assertion message: the chart as it would appear on screen."""
+    return "\n" + "\n".join(lines)
+
+
+def _check_plain(lines: list[str], width: int, unicode: bool) -> None:
+    """Every chart, at any width, is plain printable text that fits."""
+    assert isinstance(lines, list)
+    for line in lines:
+        assert isinstance(line, str)
+        assert len(line) <= width, (width, line)
+        # Printable rules out ANSI escapes and colour codes: the shape has to be
+        # carried by the characters themselves.
+        assert line.isprintable(), repr(line)
+        if not unicode:
+            assert line.isascii(), [c for c in line if not c.isascii()]
+
+
+@pytest.mark.parametrize("unicode", BOTH)
+@pytest.mark.parametrize("graph", GRAPHS)
+def test_pert_every_task_appears_exactly_once(graph: Graph, unicode: bool) -> None:
+    snaps = graph()
+    lines = live._pert_lines(snaps, snaps[0].task_id, WIDE, unicode)
+    _check_plain(lines, WIDE, unicode)
+    for s in snaps:
+        assert len(_find(lines, s.task_id)) == 1, (s.task_id, _show(lines))
+
+
+@pytest.mark.parametrize("unicode", BOTH)
+@pytest.mark.parametrize("graph", GRAPHS)
+def test_pert_same_wave_shares_a_column_and_later_waves_sit_to_the_right(
+    graph: Graph, unicode: bool
+) -> None:
+    snaps = graph()
+    # Repeated for every possible selection: a selection mark that pushed its
+    # task's id over by a bracket would break the column it sits in.
+    for selected in snaps:
+        lines = live._pert_lines(snaps, selected.task_id, WIDE, unicode)
+        column: dict[int, int] = {}
+        for s in snaps:
+            _, col = _at(lines, s.task_id)
+            column.setdefault(s.wave, col)
+            assert col == column[s.wave], (s.task_id, selected.task_id, _show(lines))
+        waves = sorted(column)
+        assert waves == list(range(max(s.wave for s in snaps) + 1))
+        for earlier, later in zip(waves, waves[1:], strict=False):
+            assert column[earlier] < column[later], _show(lines)
+
+
+@pytest.mark.parametrize("unicode", BOTH)
+def test_pert_stacks_a_wave_in_bar_order_with_bar_tab_numbers(unicode: bool) -> None:
+    # Bar order interleaves the waves, so a wave's stacking order and its tab
+    # numbers are not the same thing as its position in the column: `zulu` is
+    # second in wave 1's column but is tab 3, the key that selects it.
+    snaps = [
+        _task("yankee", "running", wave=0),
+        _task("solo", "pending", depends_on=("yankee",), wave=1),
+        _task("zulu", "ok", wave=0),
+        _task("xray", "pending", wave=0),
+    ]
+    lines = live._pert_lines(snaps, "solo", WIDE, unicode)
+    rows = [_at(lines, t)[0] for t in ("yankee", "zulu", "xray")]
+    assert rows == sorted(rows) and len(set(rows)) == 3, _show(lines)
+    for number, s in enumerate(snaps, start=1):
+        row, col = _at(lines, s.task_id)
+        # The tab number sits just before the id ("3 zulu"), allowing for a
+        # separator such as ":" or ".", and is not part of a longer number.
+        before = lines[row][:col]
+        assert re.search(rf"(?<!\d){number}\W{{0,3}}$", before), (s.task_id, _show(lines))
+
+
+@pytest.mark.parametrize("graph", GRAPHS)
+def test_pert_each_node_shows_its_status_glyph(graph: Graph) -> None:
+    # Unicode only: its glyphs cannot be mistaken for connectors, whereas the
+    # ASCII "-" and "." could come from the drawing around a node.
+    snaps = graph()
+    lines = live._pert_lines(snaps, snaps[0].task_id, WIDE, True)
+    for s in snaps:
+        row, col = _at(lines, s.task_id)
+        after = lines[row][col + len(s.task_id) :]
+        # Up to the next node on the same row, if any.
+        next_cols = [c for o in snaps for r, c in _find(lines, o.task_id) if r == row and c > col]
+        segment = after[: min(next_cols) - col - len(s.task_id)] if next_cols else after
+        assert live._UNICODE_GLYPHS[s.status] in segment, (s.task_id, _show(lines))
+
+
+@pytest.mark.parametrize("graph", GRAPHS)
+def test_pert_ascii_variant_is_pure_ascii(graph: Graph) -> None:
+    snaps = graph()
+    for width in (WIDE, 80, 60, 40, 20, 10):
+        for selected in snaps:
+            lines = live._pert_lines(snaps, selected.task_id, width, False)
+            text = "\n".join(lines)
+            assert text.isascii(), (width, [c for c in text if not c.isascii()])
+
+
+@pytest.mark.parametrize("unicode", BOTH)
+@pytest.mark.parametrize("graph", GRAPHS)
+def test_pert_selected_task_is_marked_in_plain_text(graph: Graph, unicode: bool) -> None:
+    snaps = graph()
+    charts = {s.task_id: live._pert_lines(snaps, s.task_id, WIDE, unicode) for s in snaps}
+    for lines in charts.values():
+        _check_plain(lines, WIDE, unicode)  # no reverse video or colour codes to lean on
+    # Each selection reads differently...
+    assert len({tuple(c) for c in charts.values()}) == len(snaps)
+    # ...and the difference is on the selected task's own row: compared with a
+    # chart where some task on another row is selected, that row has changed.
+    for t in snaps:
+        for u in snaps:
+            row_t, _ = _at(charts[t.task_id], t.task_id)
+            if u is t or _at(charts[t.task_id], u.task_id)[0] == row_t:
+                continue
+            assert _at(charts[u.task_id], t.task_id)[0] == row_t  # nodes do not move
+            assert charts[t.task_id][row_t] != charts[u.task_id][row_t], (
+                t.task_id,
+                u.task_id,
+                _show(charts[t.task_id]),
+            )
+
+
+@pytest.mark.parametrize("unicode", BOTH)
+def test_pert_draws_connectors_for_fan_in(unicode: bool) -> None:
+    """Positive control for the single-task test: the same check does find edges."""
+    # No `ok` task: its ASCII glyph is "+", which would pass this on its own.
+    snaps = [
+        _task("loader", "running", wave=0),
+        _task("tests", "pending", wave=0),
+        _task("verify", "pending", depends_on=("loader", "tests"), wave=1),
+    ]
+    lines = live._pert_lines(snaps, "verify", WIDE, unicode)
+    text = "\n".join(lines)
+    if unicode:
+        assert _BOX_CORNERS_AND_VERTICALS & set(text), _show(lines)
+    else:
+        assert "+" in text or "|" in text, _show(lines)
+
+
+@pytest.mark.parametrize("status", ["pending", "running", "ok", "failed"])
+@pytest.mark.parametrize("unicode", BOTH)
+def test_pert_single_task_renders_without_connectors(unicode: bool, status: str) -> None:
+    snaps = [_task("solo", status, wave=0)]
+    lines = live._pert_lines(snaps, "solo", WIDE, unicode)
+    _check_plain(lines, WIDE, unicode)
+    row, col = _at(lines, "solo")
+    assert re.search(r"(?<!\d)1\W{0,3}$", lines[row][:col]), _show(lines)
+    glyph = (live._UNICODE_GLYPHS if unicode else live._ASCII_GLYPHS)[status]
+    after = lines[row][col + len("solo") :]
+    assert glyph in after, _show(lines)
+    # The ASCII glyph for `ok` is "+", a connector character too, so the node's
+    # own glyph is taken out before looking for edges.
+    rest = [*lines[:row], after.replace(glyph, "", 1), *lines[row + 1 :]]
+    text = "\n".join(rest)
+    if unicode:
+        assert not _BOX_CORNERS_AND_VERTICALS & set(text), _show(lines)
+        # No edge leaving the node: a wave header's rule may use box drawing,
+        # but the node's own row should not.
+        assert not any("\u2500" <= c <= "\u257f" for c in lines[row]), _show(lines)
+    else:
+        assert "+" not in text and "|" not in text, _show(lines)
+        assert "-" not in after.replace(glyph, "", 1), _show(lines)
+
+
+@pytest.mark.parametrize("unicode", BOTH)
+@pytest.mark.parametrize("graph", GRAPHS)
+def test_pert_fits_width_and_degrades_honestly_at_every_width(graph: Graph, unicode: bool) -> None:
+    """From 1 column up to roomy: each line fits, and the chart either still names
+    every task exactly once or gives up with one honest line. What it may not do
+    is silently lose a task or cut an id in half."""
+    snaps = graph()
+    ids = [s.task_id for s in snaps]
+    for width in range(1, 121):
+        lines = live._pert_lines(snaps, ids[-1], width, unicode)
+        _check_plain(lines, width, unicode)
+        counts = {i: len(_find(lines, i)) for i in ids}
+        if all(n == 1 for n in counts.values()):
+            # Readable, not garbled: no word is the stub of a truncated id.
+            words = set(re.findall(r"\w+", "\n".join(lines)))
+            stubs = {w for w in words for i in ids if len(w) >= 2 and w != i and i.startswith(w)}
+            assert not stubs, (width, stubs, _show(lines))
+            continue
+        assert len(lines) == 1, (width, counts, _show(lines))
+        if width >= 40:
+            assert "narrow" in lines[0].lower(), (width, lines)
+
+
+@pytest.mark.parametrize("unicode", BOTH)
+def test_pert_full_chart_has_wave_headers_in_order(unicode: bool) -> None:
+    lines = live._pert_lines(_three_waves(), "fetch", WIDE, unicode)
+    headers = [_find(lines, f"wave {n}") for n in (1, 2, 3)]
+    assert all(len(h) == 1 for h in headers), _show(lines)
+    (r1, c1), (r2, c2), (r3, c3) = (h[0] for h in headers)
+    assert r1 == r2 == r3 and c1 < c2 < c3, _show(lines)
+
+
+def test_pert_needs_no_terminal(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Pure layout: works with curses unimportable."""
+    monkeypatch.setitem(sys.modules, "curses", None)
+    snaps = _two_waves()
+    first = live._pert_lines(snaps, "tests", 60, True)
+    assert first == live._pert_lines(snaps, "tests", 60, True)

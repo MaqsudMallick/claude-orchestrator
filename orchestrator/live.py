@@ -14,7 +14,9 @@ Layout, top to bottom:
   tasks sharing it, follow mode, and for a task that has not started, the
   dependencies it is still waiting for);
 - the selected task's scrollback plus its in-progress `pending` line, hard
-  wrapped to the window width, newest at the bottom;
+  wrapped to the window width, newest at the bottom; or, in the same area, the
+  run drawn as a PERT chart (see `_pert_lines`), shown on its own until the
+  first output arrives and toggled with `g`;
 - the key legend.
 
 Threading. curses calls block (`getch` waits up to its timeout) and are not
@@ -39,6 +41,7 @@ import contextlib
 import importlib.util
 import sys
 from collections.abc import Sequence
+from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 import anyio
@@ -69,7 +72,7 @@ _PAIR_RUNNING = 3
 _PAIR_ACCENT = 4
 
 
-def _legend(follow: bool, unicode: bool, show_tools: bool) -> str:
+def _legend(follow: bool, unicode: bool, show_tools: bool, show_chart: bool = False) -> str:
     """Return the key legend shown on the bottom row.
 
     The `f` entry names what pressing `f` will do next, not the current mode:
@@ -78,12 +81,15 @@ def _legend(follow: bool, unicode: bool, show_tools: bool) -> str:
     happening. The label is padded to the width of the longer word so `q quit`
     stays put when the mode flips. The `t` entry follows the same rule for the
     same reasons: it says what `t` will do, and is padded to its longer label.
+    So does `g`. `show_chart` defaults to False so callers that predate the
+    chart keep getting a legend for the state they knew about.
     Kept free of `self` and curses so it can be tested without a terminal.
     """
     arrows = "←/→" if unicode else "<-/->"
     toggle = ("unfollow" if follow else "follow").ljust(len("unfollow"))
     tools = ("hide tools" if show_tools else "tools").ljust(len("hide tools"))
-    return f"{arrows} or 1-9 select   f {toggle}   t {tools}   q quit"
+    chart = ("hide chart" if show_chart else "chart").ljust(len("hide chart"))
+    return f"{arrows} or 1-9 select   f {toggle}   t {tools}   g {chart}   q quit"
 
 
 # Drawn between two neighbouring tabs from different waves.
@@ -149,6 +155,13 @@ class _Viewer:
         # Tool-call lines are hidden by default: they are mostly noise next to
         # the model's own text. `t` reveals them (see `_draw_body`).
         self.show_tools = False
+        # The chart's visibility. None means "automatic": shown until the first
+        # output arrives, hidden after. Pressing `g` replaces it with an explicit
+        # choice, which then sticks (see `_chart_visible`).
+        self.chart_choice: bool | None = None
+        # Latched the first time any task has output, so the automatic chart
+        # hides exactly once rather than following the data around.
+        self.output_seen = False
         self.scr: curses.window | None = None
         self.unicode = (sys.stdout.encoding or "").lower().replace("-", "") == "utf8"
         self.glyphs = _UNICODE_GLYPHS if self.unicode else _ASCII_GLYPHS
@@ -279,6 +292,11 @@ class _Viewer:
             # manual selection this leaves follow mode alone.
             self.show_tools = not self.show_tools
             return
+        if key in (ord("g"), ord("G")):
+            # Like `t`: a different view of the same task, so neither the
+            # selection nor follow mode moves.
+            self.chart_choice = not self._chart_visible()
+            return
         ids = self.hub.task_ids()
         if not ids:
             return
@@ -302,6 +320,13 @@ class _Viewer:
     def _draw(self) -> None:
         assert self.scr is not None
         snaps = self.hub.snapshots()
+        # "Output" means something the body would actually draw: a tool line
+        # hidden by `t` would otherwise swap the chart for an empty screen.
+        if not self.output_seen and any(
+            s.pending or any(self.show_tools or line.kind != "tool" for line in s.lines)
+            for s in snaps
+        ):
+            self.output_seen = True
         current = self._pick(snaps)
         if current is not None:
             self.hub.mark_seen(current.task_id)
@@ -311,12 +336,22 @@ class _Viewer:
             self._draw_tabs(snaps, cols)
         if rows >= 2:
             self._draw_info(current, snaps, 1, cols)
+        chart = self._chart_visible()
         if rows >= 4:
-            self._draw_body(current, 2, rows - 3, cols)
+            if chart:
+                self._draw_chart(snaps, 2, rows - 3, cols)
+            else:
+                self._draw_body(current, 2, rows - 3, cols)
         if rows >= 3:
-            legend = _legend(self.follow, self.unicode, self.show_tools)
+            legend = _legend(self.follow, self.unicode, self.show_tools, chart)
             self._put(rows - 1, 0, legend, cols, self._dim())
         self.scr.refresh()
+
+    def _chart_visible(self) -> bool:
+        """The user's last `g` if they pressed it, else: shown until output arrives."""
+        if self.chart_choice is not None:
+            return self.chart_choice
+        return not self.output_seen
 
     def _pick(self, snaps: Sequence[TaskStream]) -> TaskStream | None:
         """Resolve the selected task, applying follow mode. Updates `self.selected`."""
@@ -450,6 +485,14 @@ class _Viewer:
         for offset, text in enumerate(rows[-height:]):
             self._put(top + offset, 0, text, cols, 0)
 
+    def _draw_chart(self, snaps: Sequence[TaskStream], top: int, height: int, cols: int) -> None:
+        """Blit `_pert_lines` into the body area. All the layout lives there."""
+        if height <= 0 or cols <= 0:
+            return
+        lines = _pert_lines(snaps, self.selected or "", cols, self.unicode)
+        for offset, text in enumerate(lines[:height]):
+            self._put(top + offset, 0, text, cols, 0)
+
     # -- helpers -------------------------------------------------------------
 
     def _put(self, row: int, x: int, text: str, cols: int, attr: int) -> int:
@@ -542,3 +585,273 @@ def _wrap(line: str, width: int) -> list[str]:
     if not line:
         return [""]
     return [line[i : i + width] for i in range(0, len(line), width)]
+
+
+# -- PERT chart ----------------------------------------------------------------
+
+# Box-drawing junction for a lane cell, keyed by which of its four sides carry
+# a line: (up, down, left, right). Every combination a lane can produce is
+# listed; a lane cell always has at least two sides.
+_JUNCTIONS = {
+    (False, False, True, True): "─",
+    (True, True, False, False): "│",
+    (False, True, True, False): "┐",
+    (True, False, True, False): "┘",
+    (True, True, True, False): "┤",
+    (False, True, False, True): "┌",
+    (True, False, False, True): "└",
+    (True, True, False, True): "├",
+    (False, True, True, True): "┬",
+    (True, False, True, True): "┴",
+    (True, True, True, True): "┼",
+}
+
+# Width of the blank gap between columns when no connectors are drawn in it.
+_BARE_GAP = 2
+
+_TOO_NARROW = ("terminal too narrow for the chart", "too narrow for the chart", "too narrow")
+
+
+@dataclass(frozen=True)
+class _Block:
+    """One complete-bipartite bundle of edges between two adjacent columns.
+
+    Every row in `sources` (left column) feeds every row in `targets` (right
+    column), so the whole bundle can share one vertical trunk without the
+    drawing claiming an edge that does not exist.
+    """
+
+    sources: frozenset[int]
+    targets: frozenset[int]
+    lane: int
+    top: int
+    bottom: int
+
+
+def _route(feeds: Sequence[frozenset[int]]) -> list[_Block] | None:
+    """Lay out the edges between two adjacent columns, or None if they will not draw cleanly.
+
+    `feeds[r]` is the set of left-column rows that right-column row `r`
+    depends on. Targets with identical sources share a trunk; trunks whose row
+    spans overlap get separate lanes, left to right. That covers fan-in,
+    fan-out, several side-by-side chains and the common "two groups feeding two
+    tasks" shape.
+
+    It gives up (returns None) rather than draw something misleading when a
+    source feeds two different bundles, since joined lines would then imply
+    edges that do not exist, or when a horizontal line would have to cross a
+    trunk. The caller annotates instead. Anything smarter is general edge
+    routing, which is deliberately out of scope.
+    """
+    by_sources: dict[frozenset[int], set[int]] = {}
+    for row, sources in enumerate(feeds):
+        if sources:
+            by_sources.setdefault(sources, set()).add(row)
+    claimed: set[int] = set()
+    for sources in by_sources:
+        if claimed & sources:
+            return None
+        claimed |= sources
+    bundles = sorted(
+        ((s, frozenset(t)) for s, t in by_sources.items()), key=lambda b: min(b[0] | b[1])
+    )
+    lane_ends: list[int] = []
+    blocks: list[_Block] = []
+    for sources, targets in bundles:
+        rows = sources | targets
+        top, bottom = min(rows), max(rows)
+        lane = next((i for i, end in enumerate(lane_ends) if end < top), len(lane_ends))
+        if lane == len(lane_ends):
+            lane_ends.append(bottom)
+        else:
+            lane_ends[lane] = bottom
+        blocks.append(_Block(sources, targets, lane, top, bottom))
+    # A source's line runs from the left edge to its lane, crossing every lane
+    # left of it; a target's runs from its lane to the right edge. Either may
+    # only cross a lane at a row where that lane is empty.
+    for block in blocks:
+        for row in block.sources:
+            if any(o.lane < block.lane and o.top <= row <= o.bottom for o in blocks):
+                return None
+        for row in block.targets:
+            if any(o.lane > block.lane and o.top <= row <= o.bottom for o in blocks):
+                return None
+    return blocks
+
+
+def _draw_gap(blocks: Sequence[_Block], height: int, unicode: bool) -> list[str]:
+    """Render routed blocks as `height` equal-width strings, one per row."""
+    lanes = 1 + max(b.lane for b in blocks)
+    width = 2 * lanes + 2  # lead-in, lanes one apart, two-cell lead-out
+    h = "─" if unicode else "-"
+    out: list[str] = []
+    for row in range(height):
+        cells = [" "] * width
+        for b in blocks:
+            x = 1 + 2 * b.lane
+            if row in b.sources:
+                cells[:x] = [h] * x
+            if row in b.targets:
+                cells[x + 1 :] = [h] * (width - x - 1)
+        for b in blocks:
+            if b.top <= row <= b.bottom:
+                sides = (row > b.top, row < b.bottom, row in b.sources, row in b.targets)
+                if unicode:
+                    cells[1 + 2 * b.lane] = _JUNCTIONS.get(sides, "┼")
+                else:
+                    straight = {(False, False, True, True): "-", (True, True, False, False): "|"}
+                    cells[1 + 2 * b.lane] = straight.get(sides, "+")
+        out.append("".join(cells))
+    return out
+
+
+def _pert_lines(
+    snaps: Sequence[TaskStream],
+    selected: str,
+    width: int,
+    unicode: bool,
+) -> list[str]:
+    """The run drawn as a PERT chart: plain text lines, none longer than `width`.
+
+    One column per wave, left to right; within a column, tasks in bar order.
+    Each node is `<tab number> <id> <status glyph>`, using the same numbers the
+    tab bar and the 1-9 keys use, and the selected one is wrapped in brackets
+    so it stands out without colour. Each column has a `wave N` header and a
+    rule beneath it.
+
+    Edges are drawn only between adjacent columns, with box-drawing characters
+    (`-`, `|`, `+` in ASCII), and only where `_route` can do so without
+    implying an edge that does not exist. A dependency that skips a column is
+    *not* routed: the dependent is annotated with the tab numbers of what it
+    waits on, as in `3 verify · ←1`. So is every dependent between two columns
+    whose edges `_route` declines to draw. This is a decision, not an
+    oversight: general edge routing in a terminal costs far more than it is
+    worth, and a number you can match against the tab bar is unambiguous.
+
+    When the chart does not fit, it degrades in this order, each step taken
+    only if the previous one is still too wide: drop the connectors, drop the
+    wave headers, list each wave on one line, and finally say plainly that the
+    terminal is too narrow. Every step is a complete drawing; nothing is ever
+    clipped mid-shape. Height is the caller's problem.
+
+    Pure: no curses, no colour, no state, so tests and bug reports see exactly
+    what the screen shows.
+    """
+    if not snaps or width <= 0:
+        return []
+    waves = sorted({s.wave for s in snaps})
+    column_of = {wave: c for c, wave in enumerate(waves)}
+    columns: list[list[int]] = [[] for _ in waves]
+    for i, snap in enumerate(snaps):
+        columns[column_of[snap.wave]].append(i)
+    col = [column_of[s.wave] for s in snaps]
+    row = {i: r for members in columns for r, i in enumerate(members)}
+    index_of = {s.task_id: i for i, s in enumerate(snaps)}
+    # Dependencies we know about and that sit in an earlier column. Anything
+    # else (unknown ids, a malformed same-wave edge) cannot be drawn either way.
+    deps = [
+        [index_of[d] for d in s.depends_on if d in index_of and col[index_of[d]] < col[i]]
+        for i, s in enumerate(snaps)
+    ]
+
+    # Tab numbers to print beside a node instead of drawing its edges: always
+    # for skipped columns, and for adjacent ones `_route` will not draw.
+    notes = [{d for d in deps[i] if col[d] < col[i] - 1} for i in range(len(snaps))]
+    gaps: list[list[_Block] | None] = []
+    for c in range(len(columns) - 1):
+        feeds = [frozenset(row[d] for d in deps[i] if col[d] == c) for i in columns[c + 1]]
+        blocks = _route(feeds)
+        if blocks is None:
+            for i in columns[c + 1]:
+                notes[i].update(d for d in deps[i] if col[d] == c)
+        gaps.append(blocks or None)
+
+    glyphs = _UNICODE_GLYPHS if unicode else _ASCII_GLYPHS
+    arrow = "←" if unicode else "<-"
+    texts: dict[int, str] = {}
+    for members in columns:
+        num_w = max(len(str(i + 1)) for i in members)
+        id_w = max(len(snaps[i].task_id) for i in members)
+        for i in members:
+            text = f"{str(i + 1).rjust(num_w)} {snaps[i].task_id.ljust(id_w)} "
+            text += glyphs.get(snaps[i].status, "?")
+            if notes[i]:
+                text += f" {arrow}" + ",".join(str(d + 1) for d in sorted(notes[i]))
+            texts[i] = text
+
+    for connectors, headers in ((True, True), (False, True), (False, False)):
+        grid = _grid(columns, texts, gaps, waves, selected, snaps, connectors, headers, unicode)
+        if max(len(line) for line in grid) <= width:
+            return grid
+
+    listing = [
+        f"wave {wave + 1}: "
+        + ", ".join(
+            f"[{snaps[i].task_id}]" if snaps[i].task_id == selected else snaps[i].task_id
+            for i in members
+        )
+        for wave, members in zip(waves, columns, strict=True)
+    ]
+    if max(len(line) for line in listing) <= width:
+        return listing
+    return [next((t for t in _TOO_NARROW if len(t) <= width), _TOO_NARROW[-1][:width])]
+
+
+def _grid(
+    columns: Sequence[Sequence[int]],
+    texts: dict[int, str],
+    gaps: Sequence[Sequence[_Block] | None],
+    waves: Sequence[int],
+    selected: str,
+    snaps: Sequence[TaskStream],
+    connectors: bool,
+    headers: bool,
+    unicode: bool,
+) -> list[str]:
+    """One full-detail rendering of the chart for `_pert_lines`, at any width.
+
+    Each node sits in a cell one wider than its text on both sides; the spare
+    cells hold the selection brackets, so marking a task never moves anything.
+    A node with an outgoing connector has the rest of its cell filled with rule
+    so the line visibly starts at the node rather than floating in the gap.
+    """
+    h = "─" if unicode else "-"
+    height = max(len(members) for members in columns)
+    labels = [f"wave {wave + 1}" for wave in waves]
+    text_w = [
+        max([len(texts[i]) for i in members] + ([len(label)] if headers else []))
+        for members, label in zip(columns, labels, strict=True)
+    ]
+    drawn: list[list[str]] = []
+    feeding: list[set[int]] = []
+    for gap in gaps:
+        if connectors and gap:
+            drawn.append(_draw_gap(gap, height, unicode))
+            feeding.append({r for b in gap for r in b.sources})
+        else:
+            drawn.append([" " * _BARE_GAP] * height)
+            feeding.append(set())
+
+    lines: list[str] = []
+    if headers:
+        for row_labels in (labels, [h * len(label) for label in labels]):
+            parts: list[str] = []
+            for c, label in enumerate(row_labels):
+                parts.append(" " + label.ljust(text_w[c]) + " ")
+                if c < len(drawn):
+                    parts.append(" " * len(drawn[c][0]))
+            lines.append("".join(parts).rstrip())
+    for r in range(height):
+        parts = []
+        for c, members in enumerate(columns):
+            if r < len(members):
+                i = members[r]
+                left, right = ("[", "]") if snaps[i].task_id == selected else (" ", " ")
+                fill = h if c < len(feeding) and r in feeding[c] else " "
+                parts.append(left + texts[i] + right + fill * (text_w[c] - len(texts[i])))
+            else:
+                parts.append(" " * (text_w[c] + 2))
+            if c < len(drawn):
+                parts.append(drawn[c][r])
+        lines.append("".join(parts).rstrip())
+    return lines
