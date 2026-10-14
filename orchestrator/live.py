@@ -67,8 +67,19 @@ _PAIR_RUNNING = 3
 _PAIR_ACCENT = 4
 
 
-_LEGEND = "←/→ or 1-9 select   f follow   q quit"
-_LEGEND_ASCII = "<-/-> or 1-9 select   f follow   q quit"
+def _legend(follow: bool, unicode: bool) -> str:
+    """Return the key legend shown on the bottom row.
+
+    The `f` entry names what pressing `f` will do next, not the current mode:
+    the current mode is already shown on the info row, and a legend that said
+    "follow" while following would read as an instruction to do what is already
+    happening. The label is padded to the width of the longer word so `q quit`
+    stays put when the mode flips. Kept free of `self` and curses so it can be
+    tested without a terminal.
+    """
+    arrows = "←/→" if unicode else "<-/->"
+    toggle = ("unfollow" if follow else "follow").ljust(len("unfollow"))
+    return f"{arrows} or 1-9 select   f {toggle}   q quit"
 
 
 # Drawn between two neighbouring tabs from different waves.
@@ -291,7 +302,7 @@ class _Viewer:
         if rows >= 4:
             self._draw_body(current, 2, rows - 3, cols)
         if rows >= 3:
-            legend = _LEGEND if self.unicode else _LEGEND_ASCII
+            legend = _legend(self.follow, self.unicode)
             self._put(rows - 1, 0, legend, cols, self._dim())
         self.scr.refresh()
 
