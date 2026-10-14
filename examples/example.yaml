@@ -1,0 +1,84 @@
+# Example spec: schema -> (api, docs) -> tests
+#
+#   `api` and `docs` run in parallel once `schema` finishes; `tests` waits for `api`.
+#   Difficulty picks the model: easy=haiku, medium=opus, hard=fable.
+
+version: 1
+
+# Where the agents work. Relative to this file; override with --project-dir.
+# Task `cwd` values below resolve under it.
+project_dir: ./workspace
+
+defaults:
+  cwd: .
+  difficulty: medium
+  max_turns: 40
+  # `git push` is denied unless this is true.
+  allow_push: false
+  # After a task succeeds, a separate reviewer session (same model as the task)
+  # runs the `code-review` skill. If it asks for changes, the implementer's own
+  # session is resumed to fix them, then it is reviewed again.
+  review:
+    enabled: true
+    # Rounds of review-then-fix. When these run out, whatever the task
+    # produced is accepted and the run moves on.
+    max_reviews: 2
+
+agents:
+  db-architect:
+    description: Designs data models and migrations.
+    system_prompt: |
+      You are a database architect. You design clear, normalised schemas and
+      explain the trade-offs you chose.
+
+      If the requirements are ambiguous in a way that would change the schema,
+      use the AskUserQuestion tool to ask before committing to a design.
+      Finish by summarising the schema you produced.
+    tools: [Read, Write, Edit, Bash, Glob, Grep]
+
+  backend-dev:
+    description: Implements and tests API endpoints.
+    system_prompt: |
+      You are a backend engineer. You write small, readable, tested code that
+      matches the conventions already present in the repository.
+      Ask before inventing a public API contract that was not specified.
+    tools: [Read, Write, Edit, Bash, Glob, Grep]
+
+  writer:
+    description: Writes user-facing documentation.
+    system_prompt: |
+      You are a technical writer. You write concise documentation aimed at a
+      developer who has never seen this project. No marketing language.
+    tools: [Read, Write, Glob, Grep]
+
+tasks:
+  - id: schema
+    agent: db-architect
+    difficulty: hard
+    prompt: |
+      Design the database schema for a small link-shortening service and write
+      it to schema.sql. Cover: links, click events, and per-user ownership.
+
+  - id: api
+    agent: backend-dev
+    difficulty: medium
+    depends_on: [schema]
+    prompt: |
+      Implement a FastAPI app in app.py exposing create-link, resolve-link and
+      per-link stats endpoints, matching the schema above.
+
+  - id: docs
+    agent: writer
+    difficulty: easy
+    depends_on: [schema]
+    # Prose does not need the review/fix loop; skip it and halve the cost.
+    review: {enabled: false}
+    prompt: |
+      Write README.md documenting the data model above for a new contributor.
+
+  - id: tests
+    agent: backend-dev
+    difficulty: medium
+    depends_on: [api]
+    prompt: |
+      Write pytest tests for the endpoints in app.py and make them pass.
