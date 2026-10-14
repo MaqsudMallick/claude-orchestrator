@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from graphlib import CycleError, TopologicalSorter
 from pathlib import Path
-from typing import Annotated, Literal
+from typing import Annotated, Any, Literal
 
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, model_validator
@@ -211,6 +211,62 @@ class Spec(BaseModel):
         return task.max_turns if task.max_turns is not None else self.defaults.max_turns
 
 
+_MERGE_TAG = "tag:yaml.org,2002:merge"
+
+
+class UniqueKeyLoader(yaml.SafeLoader):
+    """A `SafeLoader` that refuses a key written twice in one mapping.
+
+    Plain YAML loading keeps the last value for a repeated key, so a spec with
+    two `prompt:` lines runs whichever came second and nobody is told. Here
+    that is an error instead.
+
+    `SafeLoader` stays the base on purpose: the full loader can construct
+    arbitrary Python objects, and a spec file must never be able to run code.
+    """
+
+
+def _construct_unique_mapping(loader: UniqueKeyLoader, node: yaml.MappingNode) -> dict[Any, Any]:
+    """Check `node` for repeated keys, then build it the normal way.
+
+    The check runs over the pairs as written, before `construct_mapping`
+    flattens `<<` merge keys. Order matters: `{<<: *base, y: 99}` is a
+    legitimate override of `base.y`, but once flattened `y` appears twice and
+    a post-flatten check would reject it. Merge keys themselves are skipped;
+    they are an instruction to PyYAML, not a key of the resulting mapping.
+
+    Keys are compared by constructed value, so spellings that load to the same
+    key collide just as they would in the loaded document. Only scalar keys
+    are checked - a non-scalar or unhashable key is left to the normal
+    behaviour rather than crashing the check.
+    """
+    seen: set[Any] = set()
+    for key_node, _ in node.value:
+        if not isinstance(key_node, yaml.ScalarNode) or key_node.tag == _MERGE_TAG:
+            continue
+        key = loader.construct_object(key_node)
+        try:
+            duplicate = key in seen
+        except TypeError:
+            continue
+        if duplicate:
+            mark = key_node.start_mark
+            # A plain ValueError, not a ConstructorError: the CLI prints the
+            # message as-is, and this one should read as a single line.
+            raise ValueError(
+                f"{mark.name}:{mark.line + 1}: duplicate key {key!r}; "
+                "the second value would silently replace the first"
+            )
+        seen.add(key)
+    return loader.construct_mapping(node)
+
+
+UniqueKeyLoader.add_constructor(
+    yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG,
+    _construct_unique_mapping,
+)
+
+
 def load(path: str | Path, project_dir: str | Path | None = None) -> Spec:
     """Parse and validate a spec file. Accepts .yaml/.yml (JSON is valid YAML).
 
@@ -219,7 +275,8 @@ def load(path: str | Path, project_dir: str | Path | None = None) -> Spec:
     """
     p = Path(path).expanduser().resolve()
     with p.open("r", encoding="utf-8") as fh:
-        raw = yaml.safe_load(fh)
+        # Still safe: UniqueKeyLoader is a SafeLoader with one stricter check.
+        raw = yaml.load(fh, Loader=UniqueKeyLoader)
     if not isinstance(raw, dict):
         raise ValueError(f"{p}: expected a mapping at the top level, got {type(raw).__name__}")
     spec = Spec.model_validate(raw)
