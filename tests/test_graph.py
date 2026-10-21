@@ -5,9 +5,8 @@ import textwrap
 
 import anyio
 import pytest
-from orchestrator import graph
 from orchestrator import spec as spec_mod
-from orchestrator.runner import TaskResult
+from orchestrator.run import TaskResult, graph
 
 SPEC = """
 agents:
@@ -103,7 +102,7 @@ def test_max_parallel_is_respected(spec, monkeypatch):
 
 
 def test_upstream_text_is_injected_into_dependent_prompt(spec):
-    from orchestrator.runner import build_prompt
+    from orchestrator.run.runner import build_prompt
 
     results = {"schema": TaskResult(task_id="schema", status="ok", text="TABLE links(...)")}
     api = spec.by_id["api"]
@@ -114,7 +113,7 @@ def test_upstream_text_is_injected_into_dependent_prompt(spec):
 
 
 def test_upstream_text_is_truncated(spec):
-    from orchestrator.runner import build_prompt
+    from orchestrator.run.runner import build_prompt
 
     spec.defaults.max_context_chars = 20
     results = {"schema": TaskResult(task_id="schema", status="ok", text="x" * 500)}

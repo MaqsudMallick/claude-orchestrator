@@ -14,7 +14,6 @@ a headless run does not pay for traffic nobody reads.
 from __future__ import annotations
 
 import time
-from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -28,46 +27,15 @@ from claude_agent_sdk import (
     ToolUseBlock,
 )
 
-from . import stream_adapter, workspace
+from .. import stream
+from ..gate import make_callback
+from ..spec import Spec, Task, model_for
+from ..stream import StreamHub
+from . import workspace
 from . import worktree as wt
-from .models import model_for
-from .permissions import make_callback
+from .result import TaskResult
 from .review import run_reviews
-from .spec import Spec, Task
-from .stream import StreamHub
 from .workspace import Workspace, WorkspaceError
-
-
-@dataclass
-class TaskResult:
-    task_id: str
-    status: str  # ok | failed | skipped
-    text: str = ""
-    model: str = ""
-    difficulty: str = ""
-    cost_usd: float = 0.0
-    duration_s: float = 0.0
-    num_turns: int = 0
-    stop_reason: str | None = None
-    subtype: str | None = None
-    reason: str = ""  # why it failed or was skipped
-    cwd: str = ""
-    branch: str | None = None
-    worktree_repo: str | None = None
-    session_id: str | None = None
-    review_verdict: str = ""
-    review_cost_usd: float = 0.0
-    reviews: list[Any] = field(default_factory=list)
-    questions: list[dict[str, Any]] = field(default_factory=list)
-    denials: list[str] = field(default_factory=list)
-
-    @property
-    def ok(self) -> bool:
-        return self.status == "ok"
-
-    @property
-    def total_cost_usd(self) -> float:
-        return self.cost_usd + self.review_cost_usd
 
 
 def build_prompt(task: Task, spec: Spec, results: dict[str, TaskResult]) -> str:
@@ -113,7 +81,7 @@ class _ReviewContext:
     def log(self, msg: str) -> None:
         self._ctx.log(msg)
         prefix = f"[{self._task_id}] "
-        stream_adapter.note(self._hub, self._task_id, msg.removeprefix(prefix))
+        stream.note(self._hub, self._task_id, msg.removeprefix(prefix))
 
 
 async def run_task(task: Task, spec: Spec, results: dict[str, TaskResult], ctx: Any) -> TaskResult:
@@ -159,7 +127,7 @@ def _hub_started(hub: StreamHub | None, task: Task, model: str) -> None:
 def _hub_finished(hub: StreamHub | None, task_id: str, result: TaskResult) -> None:
     if hub is not None:
         if not result.ok and result.reason:
-            stream_adapter.note(hub, task_id, result.reason)
+            stream.note(hub, task_id, result.reason)
         hub.set_status(task_id, result.status)
 
 
@@ -240,7 +208,7 @@ async def execute_session(
             await client.query(prompt)
             async for msg in client.receive_response():
                 if isinstance(msg, StreamEvent) and hub is not None:
-                    line_open = stream_adapter.stream_event(hub, task.id, msg.event, line_open)
+                    line_open = stream.stream_event(hub, task.id, msg.event, line_open)
                 if isinstance(msg, AssistantMessage) and ctx.verbose:
                     for block in msg.content:
                         if isinstance(block, TextBlock) and block.text.strip():
@@ -249,7 +217,7 @@ async def execute_session(
                     # Text is not published here: it already arrived as deltas.
                     for block in msg.content:
                         if isinstance(block, ToolUseBlock):
-                            stream_adapter.tool(hub, task.id, block.name)
+                            stream.tool(hub, task.id, block.name)
                 if isinstance(msg, ResultMessage):
                     _record_result_message(result, msg)
     except Exception as exc:  # noqa: BLE001 - one task must not kill the run
@@ -292,7 +260,7 @@ async def review_and_finalise(
     if result.ok:
         review_ctx: Any = ctx
         if hub is not None and spec.review_for(task).enabled:
-            stream_adapter.note(hub, task.id, "review: started")
+            stream.note(hub, task.id, "review: started")
             review_ctx = _ReviewContext(ctx, hub, task.id)
         outcome = await run_reviews(task, spec, result, cwd, review_ctx)
         result.reviews = outcome.rounds

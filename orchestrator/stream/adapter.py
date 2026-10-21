@@ -12,7 +12,7 @@ from __future__ import annotations
 import time
 from typing import Any
 
-from .stream import EventKind, StreamHub, StreamUpdate
+from .hub import EventKind, StreamHub, StreamUpdate
 
 
 def _publish(hub: StreamHub, task_id: str, kind: EventKind, text: str) -> None:

@@ -21,14 +21,12 @@ from typing import TextIO
 
 import anyio
 
-from . import browse, graph, live, report
-from . import session_store as store
+from . import sessions as store
 from . import spec as spec_mod
-from .models import MODEL_BY_DIFFICULTY
-from .runner import TaskResult
-from .spec import Spec
+from .run import TaskResult, WorktreeError, graph
+from .spec import MODEL_BY_DIFFICULTY, Spec
 from .stream import StreamHub
-from .worktree import WorktreeError
+from .view import browse, live, report
 
 # Exit code for a lookup that found nothing (unknown or ambiguous run id,
 # unknown task, unreadable record). Matches the "spec not found" exit so 1
@@ -275,7 +273,7 @@ def run_spec(spec: Spec, args: argparse.Namespace) -> int:
         print(f"json report: {args.json_report}")
 
     if args.cleanup_worktrees:
-        from . import worktree as wt
+        from .run import worktree as wt
 
         # Each isolated task records its own worktree path, branch and main
         # repo, so cleanup needs nothing threaded out of the run context.

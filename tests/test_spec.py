@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 from orchestrator import spec as spec_mod
-from orchestrator.models import MODEL_BY_DIFFICULTY, model_for
+from orchestrator.spec import MODEL_BY_DIFFICULTY, model_for
 from pydantic import ValidationError
 
 BASE = """

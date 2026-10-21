@@ -25,9 +25,10 @@ from claude_agent_sdk import (
     ToolPermissionContext,
     ToolUseBlock,
 )
-from orchestrator import graph, runner, stream
 from orchestrator import spec as spec_mod
+from orchestrator.run import graph, runner
 from orchestrator.stream import Line, StreamHub, StreamUpdate
+from orchestrator.stream import hub as stream
 
 
 def text(hub, task_id, *fragments):

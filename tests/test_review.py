@@ -5,9 +5,9 @@ import textwrap
 import anyio
 import pytest
 from claude_agent_sdk import ResultMessage
-from orchestrator import review as rv
 from orchestrator import spec as spec_mod
-from orchestrator.runner import TaskResult
+from orchestrator.run import TaskResult
+from orchestrator.run import review as rv
 from pydantic import ValidationError
 
 SPEC = """
@@ -255,7 +255,7 @@ def test_review_cost_is_summed_across_rounds(tmp_path, monkeypatch):
 def test_report_shows_review_column_and_folds_review_into_cost(tmp_path):
     """Regression: the review column was silently dropped once by a bad patch,
     leaving per-task cost excluding review while the total included it."""
-    from orchestrator import report
+    from orchestrator.view import report
 
     s = load(tmp_path)
     result = TaskResult(
@@ -278,7 +278,7 @@ def test_report_shows_review_column_and_folds_review_into_cost(tmp_path):
 
 
 def test_report_flags_unresolved_findings(tmp_path):
-    from orchestrator import report
+    from orchestrator.view import report
 
     s = load(tmp_path)
     result = TaskResult(

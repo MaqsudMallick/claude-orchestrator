@@ -15,8 +15,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 
+from ..spec import Spec, Task
 from . import worktree as wt
-from .spec import Spec, Task
 from .worktree import Worktree
 
 

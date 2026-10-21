@@ -18,8 +18,8 @@ from collections.abc import Callable
 
 import anyio
 import pytest
-from orchestrator import live
 from orchestrator.stream import StreamHub, TaskStream
+from orchestrator.view import live
 
 BOTH = [pytest.param(True, id="unicode"), pytest.param(False, id="ascii")]
 FOLLOW = [pytest.param(True, id="follow-on"), pytest.param(False, id="follow-off")]

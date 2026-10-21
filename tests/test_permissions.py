@@ -1,4 +1,4 @@
-from orchestrator.policy import check_denied
+from orchestrator.gate.policy import check_denied
 
 
 def roots(tmp_path):

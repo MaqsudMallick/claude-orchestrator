@@ -22,9 +22,9 @@ from typing import Any
 import anyio
 from claude_agent_sdk import PermissionResultAllow, PermissionResultDeny
 
+from ..stream import StreamHub
 from .policy import check_denied
 from .questions import ask_human
-from .stream import StreamHub
 
 PermissionResult = PermissionResultAllow | PermissionResultDeny
 

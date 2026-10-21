@@ -27,7 +27,7 @@ from collections.abc import Sequence
 from datetime import datetime, tzinfo
 from pathlib import Path
 
-from .session_store import (
+from ..sessions import (
     SPEC_FILENAME,
     AmbiguousSessionError,
     QuestionAnswer,

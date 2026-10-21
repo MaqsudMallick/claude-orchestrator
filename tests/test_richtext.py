@@ -19,7 +19,7 @@ import unicodedata
 from dataclasses import fields
 
 import pytest
-from orchestrator.richtext import Span, render
+from orchestrator.view.richtext import Span, render
 from rich.cells import cell_len
 
 BASIC_COLOURS = {"black", "red", "green", "yellow", "blue", "magenta", "cyan", "white"}

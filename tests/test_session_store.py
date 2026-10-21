@@ -19,11 +19,11 @@ from datetime import UTC, datetime
 import anyio
 import pytest
 from claude_agent_sdk import ResultMessage, ToolPermissionContext
-from orchestrator import browse, graph, runner
-from orchestrator import review as rv
-from orchestrator import session_store as ss
 from orchestrator import spec as spec_mod
-from orchestrator.runner import TaskResult
+from orchestrator.run import TaskResult, graph, runner
+from orchestrator.run import review as rv
+from orchestrator.sessions import store as ss
+from orchestrator.view import browse
 
 # STOPGAP, belongs in tests/conftest.py. graph.run records a session by
 # default, and other test modules (test_graph.py) call it without a storage

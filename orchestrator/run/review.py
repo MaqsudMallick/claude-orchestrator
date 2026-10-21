@@ -22,12 +22,12 @@ from typing import TYPE_CHECKING, Any
 
 from claude_agent_sdk import ClaudeAgentOptions, ClaudeSDKClient, ResultMessage
 
-from .models import model_for
-from .permissions import make_callback
+from ..gate import make_callback
+from ..spec import model_for
 
 if TYPE_CHECKING:
-    from .runner import TaskResult
-    from .spec import Spec, Task
+    from ..spec import Spec, Task
+    from .result import TaskResult
 
 APPROVED = "approved"
 CHANGES_REQUESTED = "changes_requested"

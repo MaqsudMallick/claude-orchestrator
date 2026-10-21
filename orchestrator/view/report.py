@@ -6,9 +6,8 @@ import json
 from dataclasses import asdict
 from pathlib import Path
 
-from .models import MODEL_BY_DIFFICULTY
-from .runner import TaskResult
-from .spec import Spec
+from ..run import TaskResult
+from ..spec import MODEL_BY_DIFFICULTY, Spec
 
 
 def _row(cells: tuple[str, ...], widths: tuple[int, ...]) -> str:

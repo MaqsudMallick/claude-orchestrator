@@ -1,7 +1,22 @@
+# Spec files — the orchestrator's inputs, kept out of the public repo
+specs/
+*.spec.yaml
+
+# Scratch verification runs and session logs
+.verify/
+.orchestrator-worktrees/
+
+# Python
 __pycache__/
+*.py[cod]
 *.egg-info/
 .venv/
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
-.orchestrator-worktrees/
+
+# Editors / OS
+.idea/
+.vscode/
+*.swp
+.DS_Store

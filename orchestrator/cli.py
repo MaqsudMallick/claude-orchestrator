@@ -19,7 +19,7 @@ import argparse
 import sys
 from pathlib import Path
 
-from . import session_store as store
+from . import sessions as store
 from . import spec as spec_mod
 from .commands import browse_sessions, run_spec
 

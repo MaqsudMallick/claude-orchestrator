@@ -49,8 +49,8 @@ import anyio
 import anyio.from_thread
 import anyio.to_thread
 
+from ..stream import StreamHub, TaskStream
 from . import richtext
-from .stream import StreamHub, TaskStream
 
 if TYPE_CHECKING:
     import curses

@@ -68,13 +68,13 @@ from typing import TYPE_CHECKING, Annotated, Any, Literal
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, ValidationError
 
-from .models import model_for
+from ..spec import model_for
 
 if TYPE_CHECKING:
     # Type-only: the run loop imports this module, and runner -> session_store
     # -> runner would otherwise be an import cycle.
-    from .runner import TaskResult
-    from .spec import Spec
+    from ..run import TaskResult
+    from ..spec import Spec
 
 FORMAT_VERSION = 1
 ENV_VAR = "ORCHESTRATOR_SESSION_DIR"
